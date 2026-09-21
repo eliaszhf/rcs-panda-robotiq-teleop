@@ -440,9 +440,13 @@ void Franka::osc() {
   Kd_p << Kp_p.cwiseSqrt() * 2.0;
   Kd_r << Kp_r.cwiseSqrt() * 2.0;
 
-  static_q_task_ << 0.09017809387254755, -0.9824203501652151,
-      0.030509718397568178, -2.694229634937343, 0.057700675144720104,
-      1.860298714876101, 0.8713759453244422;
+  // Keep the nullspace close to the posture in which OSC was started.  The
+  // previous hard-coded posture could pull a differently posed robot as soon
+  // as torque control began; with torque saturation and an approximate
+  // nullspace projection that pull could leak into Cartesian motion.
+  const franka::RobotState initial_state = this->curr_state.load();
+  static_q_task_ = Eigen::Map<const Eigen::Matrix<double, 7, 1>>(
+      initial_state.q.data());
 
   // The manual residual mass matrix to add on the internal mass matrix
   residual_mass_vec_ << 0.0, 0.0, 0.0, 0.0, 0.1, 0.5, 0.5;
@@ -576,6 +580,11 @@ void Franka::osc() {
                    jacobian_ori.transpose() *
                        (Lambda_ori *
                         (Kp_r * ori_error - Kd_r * (jacobian_ori * dq)));
+
+      // libfranka torque commands include the model Coriolis term explicitly
+      // (as in its Cartesian impedance example).  It was calculated above but
+      // previously discarded, leaving the OSC with a systematic model error.
+      tau_d += coriolis;
 
       // nullspace control
       tau_d << tau_d + Nullspace * (static_q_task_ - q);

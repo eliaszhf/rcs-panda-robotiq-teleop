@@ -1,0 +1,48 @@
+// Non-compiled recovery snapshot of the firmware Cartesian-pose controller.
+// Restore this Franka::osc() only after stopping every FCI process, then
+// rebuild rcs_fr3 followed by rcs_panda.
+
+void Franka::osc() {
+  const bool allow_high_collision = this->m_cfg.allow_high_collision;
+  this->controller_time = 0.0;
+
+  this->set_default_robot_behavior();
+  if (allow_high_collision) {
+    this->robot.setCollisionBehavior(
+        {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+        {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+        {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+        {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}});
+  }
+
+  try {
+    this->robot.control([&](const franka::RobotState& robot_state,
+                            franka::Duration period) -> franka::CartesianPose {
+      if (this->running_controller.load() == Controller::none) {
+        return franka::MotionFinished(
+            franka::CartesianPose(robot_state.O_T_EE_c));
+      }
+
+      Eigen::Vector3d desired_tcp_position;
+      Eigen::Quaterniond desired_tcp_orientation;
+      this->curr_state.store(robot_state);
+      this->interpolator_mutex.lock();
+      this->controller_time += period.toSec();
+      this->traj_interpolator.next_step(
+          this->controller_time, desired_tcp_position,
+          desired_tcp_orientation);
+      this->interpolator_mutex.unlock();
+
+      const common::Pose desired_tcp(desired_tcp_orientation,
+                                     desired_tcp_position);
+      const common::Pose desired_ee =
+          desired_tcp * this->m_cfg.tcp_offset.inverse() *
+          common::Pose(robot_state.F_T_EE);
+      return franka::CartesianPose(desired_ee.affine_array());
+    },
+                        franka::ControllerMode::kCartesianImpedance);
+  } catch (...) {
+    this->background_exception.store(std::current_exception());
+  }
+  this->running_controller.store(Controller::none);
+}

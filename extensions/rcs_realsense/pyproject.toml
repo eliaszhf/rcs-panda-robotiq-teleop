@@ -10,7 +10,9 @@ readme = "README.md"
 license = "AGPL-3.0-or-later"
 dependencies = [
   "rcs-core>=0.7.2",
-  "pyrealsense2~=2.55.1",
+  # 2.55.1 removed L515 support. The lab's third-person camera is an L515,
+  # so keep the last Python 3.11-compatible SDK release that still supports it.
+  "pyrealsense2>=2.54.2,<2.55.1",
   "pupil_apriltags",
   "diskcache",
 ]

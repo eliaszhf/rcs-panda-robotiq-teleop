@@ -138,10 +138,15 @@ class RealSenseCameraSet(HardwareCamera):
 
         """
         for device_name, device_serial in devices_to_enable.items():
-            assert (
-                device_serial in self._available_devices
-            ), f"Device {device_name} not found. Check if it is connected."
-            self.enable_device(device_name, self._available_devices[device_serial], enable_ir_emitter)
+            matches = [
+                serial
+                for serial in self._available_devices
+                if serial.lower().lstrip("0") == device_serial.lower().lstrip("0")
+            ]
+            assert len(matches) == 1, (
+                f"Device {device_name} not found or serial is ambiguous. Check if it is connected."
+            )
+            self.enable_device(device_name, self._available_devices[matches[0]], enable_ir_emitter)
 
     def enable_device(self, camera_name: str, device_info: RealSenseDeviceInfo, enable_ir_emitter: bool = False):
         """
@@ -158,11 +163,27 @@ class RealSenseCameraSet(HardwareCamera):
         pipeline = rs.pipeline()
 
         if device_info.product_line == "D400":
-            # Enable D400 device
             self.D400_config.enable_device(device_info.serial)
             pipeline_profile = pipeline.start(self.D400_config)
+        elif device_info.product_line == "L500":
+            # L515 does not expose matching color/depth resolutions. Its lowest
+            # color mode is 960x540 while depth supports 640x480. When depth is
+            # aligned below, librealsense resamples it into the color frame.
+            l500_config = rs.config()
+            l500_config.enable_device(device_info.serial)
+            l500_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, self.frame_rate)
+            l500_config.enable_stream(
+                rs.stream.color,
+                self.resolution_width,
+                self.resolution_height,
+                rs.format.bgr8,
+                self.frame_rate,
+            )
+            if self.enable_ir:
+                l500_config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, self.frame_rate)
+            pipeline_profile = pipeline.start(l500_config)
         else:
-            msg = "unknown product line {device_info.product_line}"
+            msg = f"unknown product line {device_info.product_line}"
             raise RuntimeError(msg)
 
         # Set the acquisition parameters

@@ -107,7 +107,7 @@ def _create_robotiq_gripper(cfg: GripperConfig) -> Gripper:
 
 HARDWARE_GRIPPER_CREATORS: dict[str, typing.Callable[[GripperConfig], Gripper]] = {
     GripperType.FrankaHand.id: _create_franka_gripper,
-    "robotiq2f85": _create_robotiq_gripper,
+    GripperType("Robotiq2F85").id: _create_robotiq_gripper,
 }
 
 
@@ -162,7 +162,7 @@ class RCSPandaConfigEnvCreator(RCSEnvCreator[PandaHardwareEnvCreatorConfig]):
             camera_set.start()
             camera_set.wait_for_frames()
             logger.info("CameraSet started")
-            env = CameraSetWrapper(env, camera_set)
+            env = CameraSetWrapper(env, camera_set, include_depth=cfg.wrapper_cfg.include_depth)
 
         if cfg.relative_to != RelativeTo.NONE:
             env = RelativeActionSpace(env, max_mov=cfg.max_relative_movement, relative_to=cfg.relative_to)
@@ -195,7 +195,7 @@ class RCSPandaMultiConfigEnvCreator(RCSEnvCreator[PandaMultiHardwareEnvCreatorCo
             camera_set.start()
             camera_set.wait_for_frames()
             logger.info("CameraSet started")
-            env = CameraSetWrapper(env, camera_set)
+            env = CameraSetWrapper(env, camera_set, include_depth=cfg.wrapper_cfg.include_depth)
         return CoverWrapper(env)
 
     def config(self) -> PandaMultiHardwareEnvCreatorConfig:

@@ -180,6 +180,58 @@ class EmptyWorldFR3(SimEnvCreator):
         )
 
 
+class EmptyWorldPanda(EmptyWorldFR3):
+    """A single Panda with a simulated Robotiq 2F-85 gripper."""
+
+    def kinematics_cfg(self, cfg: SimEnvCreatorConfig) -> dict[str, tuple[str, str]]:
+        # Pinocchio's MJCF parser omits sites. The Panda's attachment body has
+        # the same pose as attachment_site, so use that body as the IK frame.
+        original_cfg = cfg if cfg._original_cfg is None else cfg._original_cfg
+        return {
+            robot_name: (robot_cfg.kinematic_model_path, "attachment")
+            for robot_name, robot_cfg in original_cfg.robot_cfgs.items()
+        }
+
+    def config(self) -> SimEnvCreatorConfig:
+        cfg = super().config()
+        robot_name = self.lead_robot_name(cfg)
+        robot_type = RobotType.Panda
+        robotiq_type = GripperType("Robotiq2F85")
+
+        robot_cfg = cfg.robot_cfgs[robot_name]
+        robot_cfg.robot_type = robot_type
+        robot_cfg.tcp_offset = GRIPPER_TCP_OFFSETS[robotiq_type]
+        robot_cfg.attachment_site = rcs.ROBOTS[robot_type].attachment_site
+        robot_cfg.kinematic_model_path = rcs.ROBOTS[robot_type].mjcf_model_path
+        robot_cfg.arm_collision_geoms = []
+        robot_cfg.joints = [f"joint{i}" for i in range(1, 8)]
+        robot_cfg.actuators = [f"actuator{i}" for i in range(1, 8)]
+        robot_cfg.base = "link0"
+        robot_cfg.dof = rcs.ROBOTS[robot_type].dof
+        robot_cfg.joint_limits = rcs.ROBOTS[robot_type].joint_limits
+        robot_cfg.q_home = rcs.ROBOTS[robot_type].q_home.copy()
+
+        assert cfg.gripper_cfgs is not None
+        gripper_cfg = cfg.gripper_cfgs[robot_name]
+        gripper_cfg.actuator = "fingers_actuator"
+        gripper_cfg.joints = ["right_driver_joint", "left_driver_joint"]
+        gripper_cfg.collision_geoms = []
+        gripper_cfg.collision_geoms_fingers = []
+        # Driver joints are 0 rad when open and 0.9 rad when closed in the MJCF.
+        gripper_cfg.max_joint_width = 0.0
+        gripper_cfg.min_joint_width = 0.9
+        gripper_cfg.max_actuator_width = 0
+        gripper_cfg.min_actuator_width = 255
+        gripper_cfg.gripper_type = robotiq_type
+
+        cfg.sim_cfg = SimConfig(async_control=False, realtime=True, frequency=30, max_convergence_steps=2000)
+        cfg.max_relative_movement = (0.005, np.deg2rad(1.0))
+        cfg.camera_cfgs = None
+        cfg.camera_adds = None
+        cfg.gripper_offsets = {robot_name: GRIPPER_MOUNT_OFFSETS[robotiq_type]}
+        return cfg
+
+
 class EmptyWorldFR3Duo(SimEnvCreator):
     gripper_mesh_quaternion_offset: ClassVar[list[float]] = [0, 0, 0.7071068, 0.7071068]
 
@@ -526,6 +578,7 @@ class EmptyWorldYam(EmptyWorldFR3):
 
 
 gym.register(id="rcs/fr3", entry_point=EmptyWorldFR3())
+gym.register(id="rcs/panda", entry_point=EmptyWorldPanda())
 gym.register(id="rcs/duo", entry_point=EmptyWorldFR3Duo())
 gym.register(id="rcs/ur5e", entry_point=EmptyWorldUR5e())
 gym.register(id="rcs/xarm7", entry_point=EmptyWorldXArm7())

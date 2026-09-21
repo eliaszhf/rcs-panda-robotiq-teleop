@@ -1,10 +1,14 @@
 import typing
+from threading import Lock
 
 from rcs._core.common import Gripper, GripperConfig, GripperState
 from rcs.common_typing import GripperConfigKwargs
-from Robotiq2F85Driver.Robotiq2F85Driver import GripperStatus, Robotiq2F85Driver
+from robotiq2f import LinuxFindTTYWithSerialNumber, Robotiq2F85, Robotiq2FStatus
 
 import rcs
+
+
+_DRIVER_CONSTRUCTION_LOCK = Lock()
 
 
 class RobotiQ2F85GripperConfig(GripperConfig):
@@ -15,6 +19,7 @@ class RobotiQ2F85GripperConfig(GripperConfig):
         speed: float = 100,
         force: float = 50,
         async_control: bool = True,
+        serial_device: str | None = None,
         **kwargs: typing.Unpack[GripperConfigKwargs],
     ) -> None:
         """
@@ -23,17 +28,21 @@ class RobotiQ2F85GripperConfig(GripperConfig):
             speed: Speed in mm/s. Must be between 20 and 150 mm/s.
             force: Force in N. Must be between 20 and 235 N.
             async_control: If True, gripper commands return immediately without waiting for the movement to complete. A new command interrupts any ongoing movement.
+            serial_device: Optional explicit /dev/ttyUSB* path. Use this when a
+                multi-interface adapter exposes the same serial number on more
+                than one port.
         """
         super().__init__(**kwargs)
         self.serial_number = serial_number
         self.speed = speed
         self.force = force
         self.async_control = async_control
+        self.serial_device = serial_device
         self.gripper_type = rcs.common.GripperType("Robotiq2F85")
 
 
 class RobotiQ2F85GripperState(GripperState):
-    def __init__(self, state: GripperStatus) -> None:
+    def __init__(self, state: Robotiq2FStatus) -> None:
         super().__init__()
         self.state = state
 
@@ -42,7 +51,27 @@ class RobotiQ2F85Gripper(Gripper):
     def __init__(self, cfg: RobotiQ2F85GripperConfig):
         super().__init__()
         self._cfg: RobotiQ2F85GripperConfig = cfg
-        self.gripper = Robotiq2F85Driver(serial_number=cfg.serial_number)
+        if cfg.serial_device is None:
+            self.gripper = Robotiq2F85(
+                serial_number=cfg.serial_number,
+                async_control=cfg.async_control,
+            )
+        else:
+            # robotiq2f 0.2.0 only accepts a serial number. Its finder cannot
+            # distinguish the two interfaces of an FT2232 with one shared
+            # serial, so override discovery only while constructing this one
+            # driver instance. The upstream API performs no Modbus write in
+            # its constructor.
+            with _DRIVER_CONSTRUCTION_LOCK:
+                original_find = LinuxFindTTYWithSerialNumber.find
+                LinuxFindTTYWithSerialNumber.find = lambda _finder, _serial: cfg.serial_device
+                try:
+                    self.gripper = Robotiq2F85(
+                        serial_number=cfg.serial_number,
+                        async_control=cfg.async_control,
+                    )
+                finally:
+                    LinuxFindTTYWithSerialNumber.find = original_find
         self._last_normalized_width = 1.0
         self.gripper.reset()
 
@@ -78,7 +107,6 @@ class RobotiQ2F85Gripper(Gripper):
             opening=float(abs_width),
             speed=self._cfg.speed,
             force=force if force != 0 else self._cfg.force,
-            blocking_call=not self._cfg.async_control,
         )
 
     def shut(self) -> None:
@@ -88,7 +116,7 @@ class RobotiQ2F85Gripper(Gripper):
         self.set_normalized_width(0.0)
 
     def close(self) -> None:
-        self.gripper.client.serial.close()
+        self.gripper.close()
 
     def get_config(self) -> GripperConfig:
         return self._cfg

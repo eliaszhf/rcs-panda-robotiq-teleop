@@ -342,10 +342,10 @@ PYBIND11_MODULE(_core, m) {
       .def("double_tap_robot_to_continue",
            &rcs::hw::Franka::double_tap_robot_to_continue)
       .def("set_cartesian_position_internal",
-           &rcs::hw::Franka::set_cartesian_position_ik, py::arg("pose"))
-      .def("set_cartesian_position_ik",
            &rcs::hw::Franka::set_cartesian_position_internal, py::arg("pose"),
-           py::arg("max_time"), py::arg("elbow"), py::arg("max_force") = 5);
+           py::arg("max_time"), py::arg("elbow"), py::arg("max_force") = 5)
+      .def("set_cartesian_position_ik",
+           &rcs::hw::Franka::set_cartesian_position_ik, py::arg("pose"));
 
   py::object gripper =
       (py::object)py::module_::import("rcs").attr("common").attr("Gripper");

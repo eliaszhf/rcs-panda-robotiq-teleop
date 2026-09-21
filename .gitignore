@@ -24,4 +24,5 @@ docs/_build
 CLAUDE.md
 uv.lock
 *.parquet
-
+/data/
+/examples/panda/*.lab.json

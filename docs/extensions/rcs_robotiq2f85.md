@@ -20,16 +20,17 @@ Get the serial number of the gripper with this command:
 udevadm info -a -n /dev/ttyUSB0 | grep serial
 ```
 
-Provide the necessary permission:
+Provide persistent device permissions through the serial-device group. Log out
+and back in after adding the user:
 ```shell
-chmod 777 /dev/ttyUSB0
+sudo usermod -aG dialout "$USER"
 ```
 
 ## Usage
 ```python
-from rcs_robotiq2f85 import RobotiQ2F85GripperConfig, RobotiQGripper
+from rcs_robotiq2f85 import RobotiQ2F85Gripper, RobotiQ2F85GripperConfig
 
-gripper = RobotiQGripper(RobotiQ2F85GripperConfig(serial_number="<YOUR_SERIAL_NUMBER>"))
+gripper = RobotiQ2F85Gripper(RobotiQ2F85GripperConfig(serial_number="<YOUR_SERIAL_NUMBER>"))
 gripper.reset()
 gripper.shut()
 print(gripper.get_normalized_width())
