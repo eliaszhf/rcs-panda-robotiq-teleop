@@ -37,6 +37,11 @@ gripper, E closes it, and Escape exits. Each Cartesian key press requests a
 
 ## Real-hardware preparation
 
+The stable lab collection workflow is documented in
+[`TELEOP_DATA_COLLECTION_ZH.md`](TELEOP_DATA_COLLECTION_ZH.md). The remote
+pi05 policy-server and single-Panda deployment workflow is documented in
+[`PI05_REMOTE_DEPLOYMENT_ZH.md`](PI05_REMOTE_DEPLOYMENT_ZH.md).
+
 The hardware scripts are deliberately separate from the simulation examples:
 
 - `panda_hardware_device_check.py` only inspects the host, network and USB

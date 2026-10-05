@@ -230,4 +230,5 @@ rsync -an --itemize-changes \
 
 更底层的硬件准备和安全约束见
 [`HARDWARE_FIELD_CHECKLIST.md`](HARDWARE_FIELD_CHECKLIST.md)；真机脚本的设计说明见
-[`README.md`](README.md)。
+[`README.md`](README.md)。服务器训练完成后的远程策略部署见
+[`PI05_REMOTE_DEPLOYMENT_ZH.md`](PI05_REMOTE_DEPLOYMENT_ZH.md)。

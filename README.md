@@ -5,6 +5,8 @@
 
 完整流程（含代码下载、采集、校验和服务器上传）见
 [`examples/panda/TELEOP_DATA_COLLECTION_ZH.md`](examples/panda/TELEOP_DATA_COLLECTION_ZH.md)。
+服务器训练完成后的远程 π0.5 推理与单臂 Panda 部署见
+[`examples/panda/PI05_REMOTE_DEPLOYMENT_ZH.md`](examples/panda/PI05_REMOTE_DEPLOYMENT_ZH.md)。
 
 每次采集新 episode 时，只需先把 `TASK_INSTRUCTION` 改成本次的真实任务描述，再复制运行整段命令：
 
