@@ -3,6 +3,33 @@
 本流程让 checkpoint 和 GPU 推理保留在 `robomme-new`，机器人电脑只运行硬件、
 安全检查和 WebSocket 客户端。真机执行前必须先完成 observe-only 审计。
 
+## 当前链路状态（2026-10-06）
+
+远程推理通信链路已经打通：
+
+```text
+robomme-new 加载 checkpoint 和 norm stats
+  → 127.0.0.1:8000 WebSocket 服务
+  → SSH 隧道
+  → 机器人电脑 OpenPI 兼容客户端
+  → reset 成功
+  → 返回有限的 (20, 8) 动作块
+```
+
+已完成的无机器人验证：
+
+- `teleop_pi05_pipeline/bin/04_serve_pi05.sh` 能从集中源码启动服务。
+- smoke checkpoint、π0.5 基础权重和对应 norm stats 均成功加载。
+- 客户端收到服务器 metadata，`reset_finished=True`。
+- 连续三次推理均返回 `(20, 8)`，且动作不含 NaN/Inf。
+- 首次请求包含 JAX 编译，耗时约 9.48 秒；热启动请求约 0.29 秒和 0.19 秒。
+- 测试结束后策略服务和 SSH 隧道均已正常关闭，没有遗留后台进程。
+
+本次验证只使用全零合成图像和状态，完全没有连接或驱动 Panda。它证明网络、序列化、
+checkpoint 加载和动作返回链路正常，但不证明策略动作适合真机。当前 smoke checkpoint
+仍禁止进入 `--execute` 模式；必须训练并选择正式 checkpoint，再使用真实机器人观测完成
+observe-only 审计。
+
 ## 1. 启动服务器策略
 
 在 `robomme-new` 上：
