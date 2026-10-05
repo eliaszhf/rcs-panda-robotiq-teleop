@@ -1,8 +1,116 @@
-## 实验室 Panda 遥操数据采集
+## 实验室快速启动：Panda 键盘遥操数据采集
 
-稳定版中文操作流程见
-[`examples/panda/TELEOP_DATA_COLLECTION_ZH.md`](examples/panda/TELEOP_DATA_COLLECTION_ZH.md)。
-文档包含开机准备、单条 episode 采集、键盘操作、离线校验和异常处理。
+> 仅用于真机。运行前必须确认：realtime 内核已激活、机械臂和夹爪周围净空、
+> 急停可用、Robotiq 和配置中的 RealSense 已连接，以及 Panda 已解锁并激活 FCI。
+
+每次采集新 episode 时，只需先把 `TASK_INSTRUCTION` 改成本次的真实任务描述，再复制运行整段命令：
+
+```bash
+cd /home/haifeng/robomme/robot-control-stack
+source /home/haifeng/miniforge3/etc/profile.d/conda.sh
+conda activate rcs
+
+# 每次重启后、首次采集前执行一次主机实时调优（需要 sudo 密码）
+sudo examples/panda/panda_realtime_tune.sh 192.168.178.12
+
+# 每次采集前修改这一行，使其与实际任务一致
+TASK_INSTRUCTION="pick up the fruit and place it in the tray"
+
+# 数据写到 VS Code 工作区之外，避免编辑器监听大量 Parquet 文件而卡顿；
+# 时间戳目录也能避免覆盖上一条数据
+RUN_DIR="/home/haifeng/robot-data/panda/episode_$(date +%Y%m%d_%H%M%S)"
+
+python examples/panda/panda_hardware_keyboard_collect.py \
+  --config examples/panda/panda_hardware_session.lab.json \
+  --instruction "$TASK_INSTRUCTION" \
+  --output "$RUN_DIR" \
+  --confirm "ENABLE-REAL-PANDA 192.168.178.12"
+
+START 192.168.178.12
+MOVE-HOME 192.168.178.12
+
+
+# 采集结束后立即离线校验刚才的数据；该命令不会连接或驱动机械臂
+python examples/panda/panda_hardware_replay.py \
+  --dataset "$RUN_DIR" \
+  --config examples/panda/panda_hardware_session.lab.json
+```
+
+
+
+首次确认提示后，输入 `START 192.168.178.12`。硬件连接并完成路径预检后，程序会显示
+固定 Home 的七个关节角；确认机械臂到 Home 的路径净空并且急停触手可及，再输入
+`MOVE-HOME 192.168.178.12`。机械臂低速到达固定 Home 后：
+
+实验室配置中的 Home TCP 约为 Panda 基座坐标 `(x=0.405, y=0.000, z=0.600) m`。
+相比旧 Home，`x` 向前移动约 10 cm、`z` 降低约 5 cm；J4 约为 `-142.3°`，为向下运动
+留出更多关节余量。首次使用该姿态时仍须目视确认整条 Home 路径净空。
+
+- `T`：开始记录当前 episode。
+- `Y`：结束记录并标记为成功。
+- `N`：结束记录并标记为失败。
+- `ESC`：安全退出并关闭硬件环境。
+
+移动键可以长按：`W/S` 控制基座 `x`，`A/D` 控制基座 `y`，`R/F` 控制基座 `z`。
+实验室配置每个控制周期移动 2 mm；控制循环默认 10 Hz，因此长按速度上限约为 20 mm/s。
+这仍低于程序允许的 5 mm 单步上限，可以缩短大范围移动时间，但靠近水果、托盘和桌面时要
+点按，避免越过目标。若某次任务需要更精细的 1 mm 操作，可在采集命令末尾临时加
+`--step 0.001`；程序会把实际步长写入该 episode 的元数据，离线校验会按对应步长检查。
+只要工具包围盒、关节余量和碰撞检查通过，连续按键目标不会因正常的控制跟踪延迟而被额外阻塞。
+
+松开或闭合夹爪后，至少继续记录 1 秒再按 `Y`。如果过早按 `Y`，程序会显示
+`WAIT before SUCCESS` 并继续记录，确保训练数据包含夹爪动作后的真实结果。键盘输入即使
+持续缓冲也不会让采集循环超过配置的 10 Hz。若 libfranka 的命令成功率连续约 1 秒低于
+0.90，程序会安全停止并把当前 episode 留作失败/未完成数据，不要用于训练。
+
+每次运行必须使用新的输出目录；上面的时间戳命令会自动创建新目录。
+
+实验室配置默认只记录 RGB，避免每步额外编码并写入约 1 MB 的深度 TIFF。确认 RGB-only
+连续运行稳定后，如任务确实需要深度，再在命令末尾加 `--include-depth` 做短时测试。
+L500/L515 的彩色流最低模式是 `960x540`，不要把该型号改成不支持的 `640x480` 彩色模式。
+
+启动真机控制前应把 CPU governor 设为 `performance`；程序检测到 `schedutil` 等模式时会
+打印 `REALTIME WARNING`。这类设置属于主机配置，不会由采集程序静默修改。
+
+本实验室机器应在每次重启后、首次采集前运行以下临时调优（需要 sudo 密码；上面的完整
+采集命令已经包含这一步）：
+
+```bash
+sudo examples/panda/panda_realtime_tune.sh 192.168.178.12
+```
+
+它通过内核 sysfs 把每个 CPU governor 切到 `performance`（不依赖与实时内核版本匹配的
+`cpupower` 包），关闭通往 Panda 的有线网卡 GRO，并暂停 `irqbalance`、把 Panda 网卡中断
+固定到本实验室主机负载较低的 CPU5，避免 1 kHz FCI 收包与 CPU0 housekeeping 竞争。
+通常重启后恢复系统默认值；也可以用 `sudo systemctl start irqbalance` 恢复动态中断分配。
+不要在机器人运动期间修改这些设置。其他主机应先检查 CPU 拓扑，再用第二个参数覆盖 IRQ
+CPU，例如 `sudo examples/panda/panda_realtime_tune.sh 192.168.178.12 5`。
+
+### 回放刚采集的一条数据
+
+先做离线检查。这个命令只读 Parquet 和 `_session.json`，不会加载硬件驱动。若仍在刚才的
+同一个终端，可直接使用上面完整流程中的 `--dataset "$RUN_DIR"`；也可以显式填写目录：
+
+```bash
+python examples/panda/panda_hardware_replay.py \
+  --dataset /home/haifeng/robot-data/panda/episode_20261001_124135 \
+  --config examples/panda/panda_hardware_session.lab.json
+```
+
+只有 dry-run 显示 `VALID` 后，重新摆好物体、确认整条轨迹净空，并保持急停可用，才可
+显式开启真机回放：
+
+```bash
+python examples/panda/panda_hardware_replay.py \
+  --dataset /home/haifeng/robot-data/panda/episode_20261001_124135 \
+  --config examples/panda/panda_hardware_session.lab.json \
+  --execute \
+  --confirm "REPLAY-REAL-PANDA 192.168.178.12"
+```
+
+程序还会依次要求连接确认、移动到固定 Home 的确认，以及包含 episode UUID 的最终回放
+确认。回放过程中按 `ESC` 可中止。真机轨迹回放只能复现记录的控制命令，不能保证物体
+因摆放误差、抓取接触和相机延迟而产生完全相同的运动结果。
 
 <div align="center">
   <img src="https://raw.githubusercontent.com/RobotControlStack/robotcontrolstack.github.io/refs/heads/master/static/images/rcs_logo_line.svg" alt="rcs logo" width="60%">
