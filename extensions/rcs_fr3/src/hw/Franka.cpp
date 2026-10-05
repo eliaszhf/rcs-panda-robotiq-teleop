@@ -9,6 +9,7 @@
 #include <Eigen/Core>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -19,6 +20,48 @@
 
 namespace rcs {
 namespace hw {
+namespace {
+
+struct RealtimeDiagnostics {
+  std::uint64_t callbacks = 0;
+  std::uint64_t callback_over_500_us = 0;
+  std::uint64_t callback_over_1000_us = 0;
+  std::uint64_t callback_over_5000_us = 0;
+  std::uint64_t max_callback_us = 0;
+  std::uint64_t robot_period_over_1500_us = 0;
+  std::uint64_t max_robot_period_us = 0;
+  std::uint64_t state_store_skips = 0;
+  std::uint64_t target_lock_skips = 0;
+
+  void record(std::uint64_t callback_us, std::uint64_t robot_period_us) {
+    callbacks++;
+    max_callback_us = std::max(max_callback_us, callback_us);
+    max_robot_period_us = std::max(max_robot_period_us, robot_period_us);
+    callback_over_500_us += callback_us > 500;
+    callback_over_1000_us += callback_us > 1000;
+    callback_over_5000_us += callback_us > 5000;
+    robot_period_over_1500_us += robot_period_us > 1500;
+  }
+};
+
+void PrintRealtimeDiagnostics(const char* controller,
+                              const RealtimeDiagnostics& diagnostics) {
+  std::cerr << "RCS REALTIME DIAGNOSTICS controller=" << controller
+            << " callbacks=" << diagnostics.callbacks
+            << " max_callback_us=" << diagnostics.max_callback_us
+            << " callback_over_500us=" << diagnostics.callback_over_500_us
+            << " callback_over_1000us=" << diagnostics.callback_over_1000_us
+            << " callback_over_5000us=" << diagnostics.callback_over_5000_us
+            << " max_robot_period_us=" << diagnostics.max_robot_period_us
+            << " robot_period_over_1500us="
+            << diagnostics.robot_period_over_1500_us
+            << " state_store_skips=" << diagnostics.state_store_skips
+            << " target_lock_skips=" << diagnostics.target_lock_skips
+            << std::endl;
+}
+
+}  // namespace
+
 common::Pose GetFlangeInBaseFrame(const franka::RobotState& robot_state) {
   return common::Pose(robot_state.O_T_EE) *
          common::Pose(robot_state.F_T_EE).inverse();
@@ -464,6 +507,7 @@ void Franka::osc() {
   joint_max_ << 2.8978, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973;
   joint_min_ << -2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973;
   avoidance_weights_ << 1., 1., 1., 1., 1., 10., 10.;
+  RealtimeDiagnostics diagnostics;
 
   try {
     this->robot.control([&](const franka::RobotState& robot_state,
@@ -487,7 +531,9 @@ void Franka::osc() {
       // Shared observations are best-effort inside the hard real-time loop.
       // The next 1 ms sample will refresh the value if a reader briefly owns
       // the mutex; waiting here can cause communication_constraints_violation.
-      this->curr_state.try_store(robot_state);
+      if (!this->curr_state.try_store(robot_state)) {
+        diagnostics.state_store_skips++;
+      }
 
       std::unique_lock<std::mutex> interpolator_lock(
           this->interpolator_mutex, std::try_to_lock);
@@ -496,6 +542,8 @@ void Franka::osc() {
         this->traj_interpolator.next_step(this->controller_time,
                                           desired_pos_EE_in_base_frame,
                                           desired_quat_EE_in_base_frame);
+      } else {
+        diagnostics.target_lock_skips++;
       }
 
       // end torques handler
@@ -625,22 +673,26 @@ void Franka::osc() {
       std::array<double, 7> tau_d_array{};
       Eigen::VectorXd::Map(&tau_d_array[0], 7) = tau_d;
 
-      // end of controller
-      std::chrono::high_resolution_clock::time_point t2 =
-          std::chrono::high_resolution_clock::now();
-      auto time =
-          std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
-
       std::array<double, 7> tau_d_rate_limited = franka::limitRate(
           franka::kMaxTorqueRate, tau_d_array, robot_state.tau_J_d);
 
       TorqueSafetyGuardFn(tau_d_rate_limited, torque_limit);
+
+      const auto callback_us = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::high_resolution_clock::now() - t1)
+              .count());
+      const auto robot_period_us = static_cast<std::uint64_t>(
+          std::max(0.0, period.toSec()) * 1'000'000.0);
+      diagnostics.record(callback_us, robot_period_us);
 
       return tau_d_rate_limited;
     });
   } catch (...) {
     this->background_exception.store(std::current_exception());
   }
+
+  PrintRealtimeDiagnostics("osc", diagnostics);
 
   // Ensure we mark the controller as stopped so we can restart later
   this->running_controller.store(Controller::none);

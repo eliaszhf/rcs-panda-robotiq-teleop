@@ -27,6 +27,17 @@ def test_realtime_callbacks_do_not_block_on_shared_state_or_interpolator() -> No
         source.index("void Franka::osc()") : source.index("void Franka::move_home()")
     ]
 
-    assert realtime_source.count("this->curr_state.try_store(robot_state);") == 3
+    assert realtime_source.count("try_store(robot_state)") == 3
     assert realtime_source.count("this->interpolator_mutex, std::try_to_lock") == 3
     assert "this->curr_state.store(robot_state);" not in realtime_source
+
+
+def test_osc_reports_realtime_timing_after_control_stops() -> None:
+    source = FRANKA_SOURCE.read_text(encoding="utf-8")
+    osc_source = source[source.index("void Franka::osc()") : source.index("void Franka::joint_controller()")]
+
+    assert 'PrintRealtimeDiagnostics("osc", diagnostics);' in osc_source
+    assert "callback_over_1000us" in source
+    assert "robot_period_over_1500us" in source
+    assert "state_store_skips" in source
+    assert "target_lock_skips" in source
