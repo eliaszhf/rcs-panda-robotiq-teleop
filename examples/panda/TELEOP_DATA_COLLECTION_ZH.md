@@ -143,7 +143,45 @@ DRY RUN ONLY: no hardware driver was imported and no command was sent.
 校验会检查控制频率、时间戳、相机帧、控制命令成功率、碰撞信号、工作空间、关节
 余量和配置一致性。保存 `RUN_DIR` 路径及校验输出，方便后续追踪。
 
-## 7. 失败和异常处理
+## 7. 上传到数据服务器
+
+只上传已经通过上一节离线校验的 episode。实验室数据服务器别名为
+`robomme-new`，原始数据接收目录为：
+
+```text
+/home/zhanghf/robomme/teleop_pi05_pipeline/01_raw_upload/incoming
+```
+
+首次使用时确认 SSH 可以登录，并创建接收目录：
+
+```bash
+ssh robomme-new
+mkdir -p /home/zhanghf/robomme/teleop_pi05_pipeline/01_raw_upload/incoming
+exit
+```
+
+上传刚刚采集并校验通过的 `$RUN_DIR`：
+
+```bash
+rsync -avh --partial --info=progress2 \
+  "$RUN_DIR/" \
+  robomme-new:/home/zhanghf/robomme/teleop_pi05_pipeline/01_raw_upload/incoming/"$(basename "$RUN_DIR")"/
+```
+
+末尾的斜杠必须保留。远端最终结构应为
+`incoming/episode_日期_时间/_session.json` 和对应的 Parquet 文件。`--partial` 会保留
+中断的临时传输；网络恢复后重复执行同一条命令即可续传，并跳过已经同步的文件。
+
+上传结束后检查远端目录大小和文件列表：
+
+```bash
+REMOTE_EPISODE="/home/zhanghf/robomme/teleop_pi05_pipeline/01_raw_upload/incoming/$(basename "$RUN_DIR")"
+ssh robomme-new "du -sh '$REMOTE_EPISODE' && find '$REMOTE_EPISODE' -maxdepth 1 -type f -printf '%f\n' | sort"
+```
+
+确认 `rsync` 成功且远端文件完整之前，不要删除本机原始数据。
+
+## 8. 失败和异常处理
 
 - 任务没有完成：按 `N`，退出后保留目录用于排查，但不要作为成功数据训练。
 - 想放弃正在记录的数据：按 `Esc`。程序会刷新数据并将它保留为失败/未完成。
@@ -158,7 +196,7 @@ DRY RUN ONLY: no hardware driver was imported and no command was sent.
 步长写进本条 episode 的 `_session.json`，离线校验会使用记录值。正式采集默认保持
 实验室配置中的 2 mm 步长。
 
-## 8. 每条数据的检查清单
+## 9. 每条数据的检查清单
 
 - [ ] 任务描述与实际任务一致
 - [ ] 场地净空，急停可用且在手边
@@ -169,6 +207,7 @@ DRY RUN ONLY: no hardware driver was imported and no command was sent.
 - [ ] 使用 `Y` 或 `N` 正确结束 episode
 - [ ] 按 `Esc` 正常关闭硬件环境
 - [ ] 离线校验输出 `VALID`
+- [ ] 使用 `rsync` 上传，并核对远端目录
 
 更底层的硬件准备和安全约束见
 [`HARDWARE_FIELD_CHECKLIST.md`](HARDWARE_FIELD_CHECKLIST.md)；真机脚本的设计说明见
