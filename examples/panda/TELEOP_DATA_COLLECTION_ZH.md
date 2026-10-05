@@ -152,12 +152,19 @@ DRY RUN ONLY: no hardware driver was imported and no command was sent.
 /home/zhanghf/robomme/teleop_pi05_pipeline/01_raw_upload/incoming
 ```
 
-首次使用时确认 SSH 可以登录，并创建接收目录：
+首次使用时安装本机 SSH 公钥。该命令会要求输入一次服务器密码，以后 `ssh` 和
+`rsync` 可以直接使用 `robomme-new` 别名：
 
 ```bash
-ssh robomme-new
-mkdir -p /home/zhanghf/robomme/teleop_pi05_pipeline/01_raw_upload/incoming
-exit
+ssh-copy-id -i ~/.ssh/id_ed25519.pub robomme-new
+ssh -o BatchMode=yes robomme-new true
+```
+
+如果第二条命令没有输出且退出状态为 0，说明免密认证已配置成功。然后创建接收目录：
+
+```bash
+ssh robomme-new \
+  'mkdir -p /home/zhanghf/robomme/teleop_pi05_pipeline/01_raw_upload/incoming'
 ```
 
 上传刚刚采集并校验通过的 `$RUN_DIR`：
@@ -178,6 +185,18 @@ rsync -avh --partial --info=progress2 \
 REMOTE_EPISODE="/home/zhanghf/robomme/teleop_pi05_pipeline/01_raw_upload/incoming/$(basename "$RUN_DIR")"
 ssh robomme-new "du -sh '$REMOTE_EPISODE' && find '$REMOTE_EPISODE' -maxdepth 1 -type f -printf '%f\n' | sort"
 ```
+
+最后再做一次只读同步检查：
+
+```bash
+rsync -an --itemize-changes \
+  "$RUN_DIR/" \
+  robomme-new:/home/zhanghf/robomme/teleop_pi05_pipeline/01_raw_upload/incoming/"$(basename "$RUN_DIR")"/
+```
+
+这条命令没有输出，表示本地与远端没有待同步的文件。需要上传多条历史 episode 时，
+应先逐条运行离线校验，再把所有通过 `VALID` 的目录作为 `rsync` 源参数；不要上传只有
+`_session.json`、没有 Parquet 文件的未完成目录。
 
 确认 `rsync` 成功且远端文件完整之前，不要删除本机原始数据。
 

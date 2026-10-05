@@ -3,6 +3,9 @@
 > 仅用于真机。运行前必须确认：realtime 内核已激活、机械臂和夹爪周围净空、
 > 急停可用、Robotiq 和配置中的 RealSense 已连接，以及 Panda 已解锁并激活 FCI。
 
+完整流程（含代码下载、采集、校验和服务器上传）见
+[`examples/panda/TELEOP_DATA_COLLECTION_ZH.md`](examples/panda/TELEOP_DATA_COLLECTION_ZH.md)。
+
 每次采集新 episode 时，只需先把 `TASK_INSTRUCTION` 改成本次的真实任务描述，再复制运行整段命令：
 
 ```bash
@@ -64,6 +67,21 @@ python examples/panda/panda_hardware_replay.py \
 0.90，程序会安全停止并把当前 episode 留作失败/未完成数据，不要用于训练。
 
 每次运行必须使用新的输出目录；上面的时间戳命令会自动创建新目录。
+
+### 上传已校验的数据
+
+只有离线校验显示 `VALID` 后，才把当前 episode 上传到服务器：
+
+```bash
+rsync -avh --partial --info=progress2 \
+  "$RUN_DIR/" \
+  robomme-new:/home/zhanghf/robomme/teleop_pi05_pipeline/01_raw_upload/incoming/"$(basename "$RUN_DIR")"/
+```
+
+首次使用 `robomme-new` 时，先运行
+`ssh-copy-id -i ~/.ssh/id_ed25519.pub robomme-new` 安装本机公钥。上传后可用同一条
+`rsync` 命令加上 `-n --itemize-changes` 做只读检查；没有输出即表示无需继续同步。
+不要上传未通过校验或没有 Parquet 文件的目录，也不要在确认远端文件完整前删除本机数据。
 
 实验室配置默认只记录 RGB，避免每步额外编码并写入约 1 MB 的深度 TIFF。确认 RGB-only
 连续运行稳定后，如任务确实需要深度，再在命令末尾加 `--include-depth` 做短时测试。
