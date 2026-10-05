@@ -32,6 +32,42 @@ enum IKSolver { franka_ik = 0, rcs_ik };
 // modes: joint-space control, operational-space control, zero-torque
 // control
 enum Controller { none = 0, jsc, osc, ztc };
+
+/**
+ * Shared state whose real-time producer never waits for a reader.
+ *
+ * The Python policy thread may be descheduled while copying a RobotState.
+ * A normal blocking mutex would then make the 1 kHz control callback miss its
+ * network deadline.  Skipping one observation update is safe because the next
+ * millisecond sample refreshes it.
+ */
+template <typename T>
+class RealtimeSharedValue {
+ private:
+  T value_;
+  mutable std::mutex mutex_;
+
+ public:
+  void store(const T& value) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    value_ = value;
+  }
+
+  bool try_store(const T& value) {
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+      return false;
+    }
+    value_ = value;
+    return true;
+  }
+
+  T load() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return value_;
+  }
+};
+
 struct FrankaConfig : common::RobotConfig {
   std::string ip;
   common::RobotType robot_type = common::RobotType::FR3;
@@ -119,7 +155,7 @@ class Franka : public common::Robot {
   // the interpolation window stays consistent for the controller's lifetime.
   int m_active_policy_rate = 20;
   common::LinearJointPositionTrajInterpolator joint_interpolator;
-  common::ThreadSafeValue<franka::RobotState> curr_state;
+  RealtimeSharedValue<franka::RobotState> curr_state;
   std::mutex interpolator_mutex;
   std::atomic<Controller> running_controller{Controller::none};
   common::ThreadSafeValue<std::exception_ptr> background_exception;

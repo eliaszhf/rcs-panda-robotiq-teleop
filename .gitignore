@@ -26,3 +26,4 @@ uv.lock
 *.parquet
 /data/
 /examples/panda/*.lab.json
+/extensions/rcs_panda/build_realtime_fix/

@@ -403,6 +403,16 @@ void Franka::osc() {
 
   this->controller_time = 0.0;
 
+  // Keep the last complete interpolated target in the real-time thread.  If
+  // the policy thread is updating the interpolator, reuse this target for one
+  // cycle instead of blocking the 1 kHz libfranka callback on a normal mutex.
+  const common::Pose initial_tcp_pose =
+      GetTCPInBaseFrame(this->curr_state.load(), this->m_cfg.tcp_offset);
+  Eigen::Vector3d desired_pos_EE_in_base_frame =
+      initial_tcp_pose.translation();
+  Eigen::Quaterniond desired_quat_EE_in_base_frame =
+      initial_tcp_pose.quaternion();
+
   // conservative collision and impedance behavior
   this->set_default_robot_behavior();
 
@@ -470,21 +480,23 @@ void Franka::osc() {
       //   return franka::MotionFinished(franka::Torques(tau_d_array));
       // }
 
-      Eigen::Vector3d desired_pos_EE_in_base_frame;
-      Eigen::Quaterniond desired_quat_EE_in_base_frame;
-
       // form deoxys/config/charmander.yml
       int policy_rate = 20;
       int traj_rate = 500;
 
-      this->curr_state.store(robot_state);
+      // Shared observations are best-effort inside the hard real-time loop.
+      // The next 1 ms sample will refresh the value if a reader briefly owns
+      // the mutex; waiting here can cause communication_constraints_violation.
+      this->curr_state.try_store(robot_state);
 
-      this->interpolator_mutex.lock();
-      this->controller_time += period.toSec();
-      this->traj_interpolator.next_step(this->controller_time,
-                                        desired_pos_EE_in_base_frame,
-                                        desired_quat_EE_in_base_frame);
-      this->interpolator_mutex.unlock();
+      std::unique_lock<std::mutex> interpolator_lock(
+          this->interpolator_mutex, std::try_to_lock);
+      if (interpolator_lock.owns_lock()) {
+        this->controller_time += period.toSec();
+        this->traj_interpolator.next_step(this->controller_time,
+                                          desired_pos_EE_in_base_frame,
+                                          desired_quat_EE_in_base_frame);
+      }
 
       // end torques handler
 
@@ -641,6 +653,9 @@ void Franka::joint_controller() {
   const common::Vector7d torque_limit = this->m_cfg.torque_limit;
   const bool allow_high_collision = this->m_cfg.allow_high_collision;
   this->controller_time = 0.0;
+  const franka::RobotState initial_state = this->curr_state.load();
+  common::Vector7d desired_q =
+      Eigen::Map<const common::Vector7d>(initial_state.q.data());
 
   // conservative collision and impedance behavior
   this->set_default_robot_behavior();
@@ -671,14 +686,14 @@ void Franka::joint_controller() {
         return franka::MotionFinished(franka::Torques(robot_state.tau_J_d));
       }
 
-      common::Vector7d desired_q;
+      this->curr_state.try_store(robot_state);
 
-      this->curr_state.store(robot_state);
-
-      this->interpolator_mutex.lock();
-      this->controller_time += period.toSec();
-      this->joint_interpolator.next_step(this->controller_time, desired_q);
-      this->interpolator_mutex.unlock();
+      std::unique_lock<std::mutex> interpolator_lock(
+          this->interpolator_mutex, std::try_to_lock);
+      if (interpolator_lock.owns_lock()) {
+        this->controller_time += period.toSec();
+        this->joint_interpolator.next_step(this->controller_time, desired_q);
+      }
       // end torques handler
 
       Eigen::Matrix<double, 7, 1> tau_d;
@@ -755,11 +770,13 @@ void Franka::zero_torque_controller() {
   try {
     this->robot.control([&](const franka::RobotState& robot_state,
                             franka::Duration period) -> franka::Torques {
-      this->curr_state.store(robot_state);
+      this->curr_state.try_store(robot_state);
 
-      this->interpolator_mutex.lock();
-      this->controller_time += period.toSec();
-      this->interpolator_mutex.unlock();
+      std::unique_lock<std::mutex> interpolator_lock(
+          this->interpolator_mutex, std::try_to_lock);
+      if (interpolator_lock.owns_lock()) {
+        this->controller_time += period.toSec();
+      }
       if (this->running_controller.load() == Controller::none) {
         // stop
         return franka::MotionFinished(franka::Torques({0, 0, 0, 0, 0, 0, 0}));

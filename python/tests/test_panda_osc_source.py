@@ -19,3 +19,14 @@ def test_osc_adds_model_coriolis_before_safety_limiting() -> None:
     coriolis_add = source.index("tau_d += coriolis;")
     torque_limit = source.index("TorqueSafetyGuardFn(tau_d_rate_limited, torque_limit);", coriolis_add)
     assert coriolis_add < torque_limit
+
+
+def test_realtime_callbacks_do_not_block_on_shared_state_or_interpolator() -> None:
+    source = FRANKA_SOURCE.read_text(encoding="utf-8")
+    realtime_source = source[
+        source.index("void Franka::osc()") : source.index("void Franka::move_home()")
+    ]
+
+    assert realtime_source.count("this->curr_state.try_store(robot_state);") == 3
+    assert realtime_source.count("this->interpolator_mutex, std::try_to_lock") == 3
+    assert "this->curr_state.store(robot_state);" not in realtime_source
