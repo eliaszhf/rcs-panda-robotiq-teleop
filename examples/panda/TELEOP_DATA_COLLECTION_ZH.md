@@ -7,7 +7,32 @@ Parquet 数据集。
 > 真机运行前必须确认机械臂与夹爪周围净空、急停可用、Panda 已解锁并启用
 > FCI、Robotiq 与相机已连接。机器人运动期间，操作员不得离开急停可触及范围。
 
-## 1. 当前固定配置
+## 1. 下载代码
+
+项目 GitHub 地址：
+
+<https://github.com/eliaszhf/rcs-panda-robotiq-teleop>
+
+本文档和当前稳定采集代码位于 `haifeng-panda-teleop` 分支。第一次下载可执行：
+
+```bash
+git clone --branch haifeng-panda-teleop --single-branch \
+  https://github.com/eliaszhf/rcs-panda-robotiq-teleop.git
+cd rcs-panda-robotiq-teleop
+```
+
+已经克隆过仓库时，在没有未保存修改的前提下更新代码：
+
+```bash
+git switch haifeng-panda-teleop
+git pull origin haifeng-panda-teleop
+```
+
+浏览器也可以直接打开该分支：
+
+<https://github.com/eliaszhf/rcs-panda-robotiq-teleop/tree/haifeng-panda-teleop>
+
+## 2. 当前固定配置
 
 - Panda IP：`192.168.178.12`
 - 配置文件：`examples/panda/panda_hardware_session.lab.json`
@@ -21,7 +46,7 @@ Parquet 数据集。
 不要随意修改实验室配置中的 TCP、工具包围盒、工作空间、Home 关节角或 Desk
 机械参数。需要变更时应先重新完成现场安全检查。
 
-## 2. 每次开机后的准备
+## 3. 每次开机后的准备
 
 打开一个终端，进入仓库并激活环境：
 
@@ -41,7 +66,7 @@ sudo examples/panda/panda_realtime_tune.sh 192.168.178.12
 `irqbalance`，并把 Panda 网卡中断固定到 CPU5。这些设置通常会在主机重启后恢复。
 不要在机器人运动期间运行调优脚本。
 
-## 3. 采集一条 episode
+## 4. 采集一条 episode
 
 先修改任务描述，再整段复制执行：
 
@@ -69,7 +94,7 @@ shell 命令：
 初始化会执行 Franka 错误恢复并打开 Robotiq 夹爪。第二次确认后，机械臂会低速
 移动到固定 Home。到达 Home 且终端显示键盘说明后，才开始遥操。
 
-## 4. 遥操按键
+## 5. 遥操按键
 
 保持采集终端处于焦点：
 
@@ -97,7 +122,7 @@ shell 命令：
 满 1 秒后重新按 `Y`。一旦按下 `Y` 或 `N`，本进程中的 episode 就已结束。下一条
 数据必须退出程序，并使用新的 `RUN_DIR` 重新启动。
 
-## 5. 立即离线校验
+## 6. 立即离线校验
 
 采集程序退出后，在同一个终端运行：
 
@@ -118,7 +143,7 @@ DRY RUN ONLY: no hardware driver was imported and no command was sent.
 校验会检查控制频率、时间戳、相机帧、控制命令成功率、碰撞信号、工作空间、关节
 余量和配置一致性。保存 `RUN_DIR` 路径及校验输出，方便后续追踪。
 
-## 6. 失败和异常处理
+## 7. 失败和异常处理
 
 - 任务没有完成：按 `N`，退出后保留目录用于排查，但不要作为成功数据训练。
 - 想放弃正在记录的数据：按 `Esc`。程序会刷新数据并将它保留为失败/未完成。
@@ -133,7 +158,7 @@ DRY RUN ONLY: no hardware driver was imported and no command was sent.
 步长写进本条 episode 的 `_session.json`，离线校验会使用记录值。正式采集默认保持
 实验室配置中的 2 mm 步长。
 
-## 7. 每条数据的检查清单
+## 8. 每条数据的检查清单
 
 - [ ] 任务描述与实际任务一致
 - [ ] 场地净空，急停可用且在手边
