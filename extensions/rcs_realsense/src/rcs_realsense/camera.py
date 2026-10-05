@@ -163,8 +163,24 @@ class RealSenseCameraSet(HardwareCamera):
         pipeline = rs.pipeline()
 
         if device_info.product_line == "D400":
-            self.D400_config.enable_device(device_info.serial)
-            pipeline_profile = pipeline.start(self.D400_config)
+            # D435 has no 960x540 depth profile. Acquire depth at its native
+            # 640x480 mode and align it to the configured color resolution.
+            d400_config = rs.config()
+            d400_config.enable_device(device_info.serial)
+            d400_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, self.frame_rate)
+            d400_config.enable_stream(
+                rs.stream.color,
+                self.resolution_width,
+                self.resolution_height,
+                rs.format.bgr8,
+                self.frame_rate,
+            )
+            if self.enable_ir:
+                d400_config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, self.frame_rate)
+            if self.enable_imu:
+                d400_config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 250)
+                d400_config.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f, 200)
+            pipeline_profile = pipeline.start(d400_config)
         elif device_info.product_line == "L500":
             # L515 does not expose matching color/depth resolutions. Its lowest
             # color mode is 960x540 while depth supports 640x480. When depth is

@@ -11,6 +11,7 @@
   "tcp_translation": null,
   "tcp_quaternion": null,
   "joint_limit_margin_deg": 5.0,
+  "home_joints_deg": null,
   "step": 0.005,
   "speed_factor": 0.05,
   "frequency": 20,

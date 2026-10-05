@@ -1,8 +1,9 @@
 """Safety-gated keyboard collection for one real Panda + Robotiq 2F-85.
 
-This is event-driven teleoperation sampled at a fixed rate.  It deliberately
-has no automatic homing. Hardware use still requires an operator at the
-emergency stop and a correctly configured Desk.
+This is event-driven teleoperation sampled at a fixed rate.  Before collection,
+it moves to a configured joint-space home pose after a separate operator
+confirmation. Hardware use still requires an operator at the emergency stop
+and a correctly configured Desk.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import contextlib
 import datetime as dt
 import ipaddress
 import json
+import os
 import select
 import sys
 import termios
@@ -29,7 +31,14 @@ MAX_STEP_METERS = 0.005
 MAX_SPEED_FACTOR = 0.1
 MAX_INITIAL_GRIPPER_SPEED = 50.0
 MAX_INITIAL_GRIPPER_FORCE = 50.0
+MIN_POST_GRIPPER_RECORD_SECONDS = 1.0
+MIN_CONTROL_COMMAND_SUCCESS_RATE = 0.9
+MAX_LOW_CONTROL_SECONDS = 1.0
+RECORD_BATCH_SECONDS = 5
 CONFIRM_PREFIX = "ENABLE-REAL-PANDA"
+HOME_CONFIRM_PREFIX = "MOVE-HOME"
+HOME_PATH_SAMPLES = 101
+HOME_TOLERANCE_DEG = 1.0
 DESK_END_EFFECTOR_PRESET = "Franka Hand"
 FRANKA_HAND_MASS_KG = 0.73
 FRANKA_HAND_COM_M = np.array([-0.01, 0.0, 0.03])
@@ -71,6 +80,41 @@ def accumulated_offset(current_offset: np.ndarray, key: str, step_meters: float)
     offset = np.asarray(current_offset, dtype=float).copy()
     delta = delta_for_key(key, step_meters)
     return offset if delta is None else offset + delta
+
+
+def realtime_host_warnings() -> list[str]:
+    """Return actionable host warnings without changing system settings."""
+    governors = set()
+    for path in Path("/sys/devices/system/cpu").glob("cpu*/cpufreq/scaling_governor"):
+        try:
+            governors.add(path.read_text(encoding="utf-8").strip())
+        except OSError:
+            continue
+    warnings = []
+    if governors and governors != {"performance"}:
+        warnings.append(
+            "CPU governors are " + ", ".join(sorted(governors))
+            + "; use the performance governor for libfranka control"
+        )
+    return warnings
+
+
+def read_pending_keys(fd: int, timeout: float) -> str:
+    """Read all currently buffered terminal input after waiting at most timeout."""
+    readable, _, _ = select.select([fd], [], [], max(0.0, timeout))
+    if not readable:
+        return ""
+    return os.read(fd, 4096).decode(errors="ignore").lower()
+
+
+def control_command_success_rate(observation: dict) -> float | None:
+    value = observation.get("right", {}).get("robot_state", {}).get(
+        "control_command_success_rate"
+    )
+    if value is None:
+        return None
+    rate = float(value)
+    return rate if np.isfinite(rate) else None
 
 
 def workspace_allows(
@@ -132,6 +176,54 @@ def joints_have_margin(q: np.ndarray, limits: np.ndarray, margin_radians: float)
         and np.all(q >= limits[0] + margin_radians)
         and np.all(q <= limits[1] - margin_radians)
     )
+
+
+def joint_margin_violations(
+    q: np.ndarray, limits: np.ndarray, margin_radians: float
+) -> list[str]:
+    """Describe joints outside the configured safe interval (one-based indices)."""
+    q = np.asarray(q, dtype=float)
+    limits = np.asarray(limits, dtype=float)
+    if q.shape != (7,) or limits.shape != (2, 7):
+        return [f"invalid joint/limit shapes: q={q.shape}, limits={limits.shape}"]
+    safe_low = limits[0] + margin_radians
+    safe_high = limits[1] - margin_radians
+    violations = []
+    for index, (measured, low, high) in enumerate(zip(q, safe_low, safe_high), start=1):
+        if not np.isfinite(measured) or measured < low or measured > high:
+            violations.append(
+                f"J{index}={np.rad2deg(measured):.2f} deg "
+                f"(safe {np.rad2deg(low):.2f}..{np.rad2deg(high):.2f} deg)"
+            )
+    return violations
+
+
+def home_path_within_workspace(
+    kinematics: Any,
+    start_joints: np.ndarray,
+    home_joints: np.ndarray,
+    tcp_offset: Any,
+    tool_box_min: np.ndarray,
+    tool_box_max: np.ndarray,
+    workspace_min: np.ndarray,
+    workspace_max: np.ndarray,
+    samples: int = HOME_PATH_SAMPLES,
+) -> bool:
+    """Check the sampled joint interpolation used as a home-path preflight."""
+    start_joints = np.asarray(start_joints, dtype=float)
+    home_joints = np.asarray(home_joints, dtype=float)
+    if start_joints.shape != (7,) or home_joints.shape != (7,):
+        raise ValueError("home path requires two seven-joint poses")
+    if samples < 2:
+        raise ValueError("home path requires at least two samples")
+    for alpha in np.linspace(0.0, 1.0, samples):
+        pose = kinematics.forward((1.0 - alpha) * start_joints + alpha * home_joints, tcp_offset)
+        tcp_tquat = np.concatenate((pose.translation(), pose.rotation_q()))
+        if not tool_within_workspace(
+            tcp_tquat, tool_box_min, tool_box_max, workspace_min, workspace_max
+        ):
+            return False
+    return True
 
 
 def collision_report(observation: dict) -> list[str]:
@@ -246,6 +338,7 @@ def validate_safety_args(
         "tool_box_max",
         "tcp_translation",
         "tcp_quaternion",
+        "home_joints_deg",
     )
     missing = [name for name in required if getattr(args, name, None) in (None, "")]
     if missing:
@@ -314,6 +407,9 @@ def validate_safety_args(
         raise ValueError("--tcp-quaternion must be normalized")
     if not (0.0 < args.joint_limit_margin_deg <= 20.0):
         raise ValueError("--joint-limit-margin-deg must be > 0 and <= 20")
+    home_joints_deg = np.asarray(args.home_joints_deg, dtype=float)
+    if home_joints_deg.shape != (7,) or not np.all(np.isfinite(home_joints_deg)):
+        raise ValueError("--home-joints-deg must contain seven finite values")
     return robot_ip, output, workspace_min, workspace_max, tool_box_min, tool_box_max, cameras
 
 
@@ -379,6 +475,7 @@ def create_hardware_env(robot_ip: str, gripper_serial: str, args: argparse.Names
         translation=np.asarray(args.tcp_translation, dtype=float),
         quaternion=np.asarray(args.tcp_quaternion, dtype=float),
     )
+    robot_cfg.q_home = np.deg2rad(np.asarray(args.home_joints_deg, dtype=float))
     # This is a shared robot. Desk's stock Franka Hand mechanical data is
     # authoritative, so this process must never call libfranka setLoad().
     robot_cfg.load_parameters = None
@@ -424,6 +521,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum tool-envelope corner relative to TCP, in metres.",
     )
     parser.add_argument("--joint-limit-margin-deg", type=float, default=5.0)
+    parser.add_argument(
+        "--home-joints-deg",
+        nargs=7,
+        type=float,
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6", "J7"),
+        help="Fixed startup home pose in joint degrees.",
+    )
     parser.add_argument(
         "--tcp-translation",
         nargs=3,
@@ -497,12 +601,15 @@ def main() -> None:
     print(f"workspace: {workspace_min} .. {workspace_max}; step: {args.step} m")
     print(f"tool envelope relative to TCP: {tool_box_min} .. {tool_box_max}")
     print(f"RealSense cameras: {cameras or 'disabled'}; include depth: {args.include_depth}")
+    for warning in realtime_host_warnings():
+        print(f"REALTIME WARNING: {warning}")
     try:
         preflight_cameras(cameras)
     except RuntimeError as error:
         raise SystemExit(f"Camera preflight failed before hardware connection: {error}") from error
     print("Initialization performs Franka error recovery and OPENS the Robotiq gripper.")
-    print("It does not home the arm. Keep the workspace clear and guard the emergency stop.")
+    print(f"Configured home joints (deg): {np.asarray(args.home_joints_deg, dtype=float)}")
+    print("A second confirmation is required before home motion. Keep the workspace clear.")
     if input(f"Type 'START {robot_ip}' to create the hardware environment: ").strip() != f"START {robot_ip}":
         raise SystemExit("Cancelled before opening either hardware driver.")
 
@@ -518,14 +625,51 @@ def main() -> None:
     try:
         base_env = create_hardware_env(robot_ip, args.gripper_serial, args)
         observation, info = base_env.reset()
-        current_tquat = np.asarray(observation["right"]["tquat"], dtype=float)
-        current_tcp = current_tquat[:3]
-        session_origin_tquat = current_tquat.copy()
-        command_offset = np.zeros(3, dtype=float)
         robot = base_env.get_wrapper_attr("robot")["right"]
         verify_franka_hand_defaults(robot.get_state().robot_state)
         joint_limits = np.asarray(robot.get_config().joint_limits, dtype=float)
         joint_margin = np.deg2rad(args.joint_limit_margin_deg)
+        start_joints = np.asarray(observation["right"]["joints"], dtype=float)
+        home_joints = np.deg2rad(np.asarray(args.home_joints_deg, dtype=float))
+        if not joints_have_margin(home_joints, joint_limits, joint_margin):
+            raise RuntimeError("Configured home pose is inside the joint-limit margin")
+        initial_collisions = collision_report(observation)
+        if initial_collisions:
+            raise RuntimeError(f"Initial collision signal asserted: {initial_collisions}")
+        kinematics = robot.get_ik()
+        if kinematics is None:
+            raise RuntimeError("Cannot preflight home path without Panda kinematics")
+        if not home_path_within_workspace(
+            kinematics,
+            start_joints,
+            home_joints,
+            robot.get_config().tcp_offset,
+            tool_box_min,
+            tool_box_max,
+            workspace_min,
+            workspace_max,
+        ):
+            raise RuntimeError("Sampled path to home would move the tool envelope outside the workspace")
+        expected_home_confirmation = f"{HOME_CONFIRM_PREFIX} {robot_ip}"
+        home_confirmation = input(
+            f"Type '{expected_home_confirmation}' to move to the fixed home pose: "
+        ).strip()
+        if home_confirmation != expected_home_confirmation:
+            raise SystemExit("Cancelled before home motion.")
+        robot.move_home()
+        observation, info = base_env.reset()
+        measured_home = np.asarray(observation["right"]["joints"], dtype=float)
+        if not np.allclose(
+            measured_home, home_joints, rtol=0.0, atol=np.deg2rad(HOME_TOLERANCE_DEG)
+        ):
+            raise RuntimeError(
+                "Home motion did not reach the configured pose within "
+                f"{HOME_TOLERANCE_DEG} deg; measured={np.rad2deg(measured_home)}"
+            )
+        current_tquat = np.asarray(observation["right"]["tquat"], dtype=float)
+        current_tcp = current_tquat[:3]
+        session_origin_tquat = current_tquat.copy()
+        command_offset = np.zeros(3, dtype=float)
         if not tool_within_workspace(
             current_tquat, tool_box_min, tool_box_max, workspace_min, workspace_max
         ):
@@ -534,7 +678,7 @@ def main() -> None:
             raise RuntimeError("Initial arm position is inside the configured joint-limit margin")
         initial_collisions = collision_report(observation)
         if initial_collisions:
-            raise RuntimeError(f"Initial collision signal asserted: {initial_collisions}")
+            raise RuntimeError(f"Collision signal asserted after home: {initial_collisions}")
 
         output.mkdir(parents=True, exist_ok=False)
         metadata = {
@@ -544,7 +688,12 @@ def main() -> None:
             "gripper_device": args.gripper_device,
             "instruction": args.instruction,
             "frequency": args.frequency,
+            "fixed_rate_keyboard_loop": True,
             "step_meters": args.step,
+            "record_batch_seconds": RECORD_BATCH_SECONDS,
+            "minimum_post_gripper_record_seconds": MIN_POST_GRIPPER_RECORD_SECONDS,
+            "minimum_control_command_success_rate": MIN_CONTROL_COMMAND_SUCCESS_RATE,
+            "maximum_low_control_seconds": MAX_LOW_CONTROL_SECONDS,
             "speed_factor": args.speed_factor,
             "relative_action_reference": "configured_session_origin",
             "workspace_min": workspace_min.tolist(),
@@ -552,6 +701,7 @@ def main() -> None:
             "tool_box_min_tcp_frame": tool_box_min.tolist(),
             "tool_box_max_tcp_frame": tool_box_max.tolist(),
             "joint_limit_margin_deg": args.joint_limit_margin_deg,
+            "home_joints_deg": args.home_joints_deg,
             "desk_end_effector_preset": DESK_END_EFFECTOR_PRESET,
             "libfranka_set_load_called": False,
             "flange_to_tcp_translation_m": args.tcp_translation,
@@ -567,7 +717,10 @@ def main() -> None:
             base_env,
             str(output),
             args.instruction,
-            batch_size=min(16, args.frequency),
+            # Five-second batches keep the asynchronous writer comfortably
+            # ahead of image production. Tiny batches create many Parquet
+            # files and can fill the bounded writer queue, stalling control.
+            batch_size=max(1, args.frequency * RECORD_BATCH_SECONDS),
             max_rows_per_group=100,
             max_rows_per_file=1000,
         )
@@ -576,33 +729,64 @@ def main() -> None:
         period = 1.0 / args.frequency
         print("Initial TCP:", current_tcp)
         print("W/S x, A/D y, R/F z, Q open, E close")
+        print(
+            f"Each movement tick: {args.step * 1000:.1f} mm; "
+            f"held-key maximum: {args.step * args.frequency * 1000:.1f} mm/s"
+        )
         print("T start recording, Y finish SUCCESS, N finish FAILURE, ESC exit")
         with raw_terminal():
             next_tick = time.monotonic()
+            last_status_print = 0.0
+            last_gripper_change = float("-inf")
+            low_control_ticks = 0
             while True:
                 timeout = max(0.0, next_tick - time.monotonic())
-                readable, _, _ = select.select([sys.stdin], [], [], timeout)
-                key = sys.stdin.read(1).lower() if readable else ""
-                if key == "\x1b":
+                keys = read_pending_keys(sys.stdin.fileno(), timeout)
+                # select() returns immediately when a key is buffered. Still
+                # wait for the scheduled deadline so held keys cannot make the
+                # control/data loop run at the keyboard repeat or camera rate.
+                remaining = next_tick - time.monotonic()
+                if remaining > 0.0:
+                    time.sleep(remaining)
+
+                if "\x1b" in keys:
                     break
-                if key == "t":
-                    if episode_finished:
-                        print("Episode already finished; exit and use a new output directory.")
-                    elif not recording:
-                        recorder.start_record()
-                        recording = True
-                        print("RECORDING STARTED")
-                elif key == "y" and recording:
-                    recorder.success()
-                    recorder.stop_record()
-                    recording = False
-                    episode_finished = True
-                    print("RECORDING STOPPED: SUCCESS")
-                elif key == "n" and recording:
-                    recorder.stop_record()
-                    recording = False
-                    episode_finished = True
-                    print("RECORDING STOPPED: FAILURE")
+
+                key = ""
+                for event in keys:
+                    if event in KEY_DELTAS:
+                        key = event
+                    elif event == "t":
+                        if episode_finished:
+                            print("Episode already finished; exit and use a new output directory.")
+                        elif not recording:
+                            recorder.start_record()
+                            recording = True
+                            print("RECORDING STARTED")
+                    elif event in {"q", "e"}:
+                        requested_gripper_state = 1 if event == "q" else 0
+                        if requested_gripper_state != gripper_state:
+                            gripper_state = requested_gripper_state
+                            last_gripper_change = time.monotonic()
+                        key = event
+                    elif event == "y" and recording:
+                        tail_seconds = time.monotonic() - last_gripper_change
+                        if tail_seconds < MIN_POST_GRIPPER_RECORD_SECONDS:
+                            print(
+                                "WAIT before SUCCESS: record at least "
+                                f"{MIN_POST_GRIPPER_RECORD_SECONDS:.1f} s after the last gripper command"
+                            )
+                        else:
+                            recorder.success()
+                            recorder.stop_record()
+                            recording = False
+                            episode_finished = True
+                            print("RECORDING STOPPED: SUCCESS")
+                    elif event == "n" and recording:
+                        recorder.stop_record()
+                        recording = False
+                        episode_finished = True
+                        print("RECORDING STOPPED: FAILURE")
 
                 delta = delta_for_key(key, args.step)
                 if delta is not None:
@@ -624,11 +808,6 @@ def main() -> None:
                     else:
                         command_offset = proposed_offset
 
-                if key == "q":
-                    gripper_state = 1
-                elif key == "e":
-                    gripper_state = 0
-
                 observation, reward, terminated, truncated, info = recorder.step(
                     make_action(command_offset, gripper_state)
                 )
@@ -643,16 +822,35 @@ def main() -> None:
                 ):
                     raise RuntimeError("SAFETY STOP: measured tool envelope left the workspace")
                 if not joints_have_margin(observation["right"]["joints"], joint_limits, joint_margin):
-                    raise RuntimeError("SAFETY STOP: measured joint entered the configured limit margin")
+                    violations = joint_margin_violations(
+                        observation["right"]["joints"], joint_limits, joint_margin
+                    )
+                    raise RuntimeError(
+                        "SAFETY STOP: measured joint entered the configured limit margin: "
+                        + "; ".join(violations)
+                    )
                 collisions = collision_report(observation)
                 if collisions:
                     raise RuntimeError(f"SAFETY STOP: collision signal asserted: {collisions}")
-                if key in KEY_DELTAS or key in {"q", "e"}:
+                success_rate = control_command_success_rate(observation)
+                if success_rate is not None and success_rate < MIN_CONTROL_COMMAND_SUCCESS_RATE:
+                    low_control_ticks += 1
+                else:
+                    low_control_ticks = 0
+                if low_control_ticks >= max(1, int(args.frequency * MAX_LOW_CONTROL_SECONDS)):
+                    raise RuntimeError(
+                        "SAFETY STOP: libfranka control command success rate stayed below "
+                        f"{MIN_CONTROL_COMMAND_SUCCESS_RATE:.2f} for approximately "
+                        f"{MAX_LOW_CONTROL_SECONDS:.1f} s (latest={success_rate:.3f})"
+                    )
+                now = time.monotonic()
+                if (key in KEY_DELTAS or key in {"q", "e"}) and now - last_status_print >= 0.2:
                     print(
                         f"key={key} target_offset={command_offset} TCP={current_tcp} "
                         f"gripper={observation['right']['gripper']} "
                         f"recording={recording} reward={reward}"
                     )
+                    last_status_print = now
                 if terminated or truncated:
                     print("Environment stopped:", info)
                     break

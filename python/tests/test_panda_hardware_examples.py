@@ -41,7 +41,15 @@ assert HOLD_SPEC is not None and HOLD_SPEC.loader is not None
 HOLD_MODULE = importlib.util.module_from_spec(HOLD_SPEC)
 HOLD_SPEC.loader.exec_module(HOLD_MODULE)
 
+REPLAY_SCRIPT = Path(__file__).parents[2] / "examples" / "panda" / "panda_hardware_replay.py"
+REPLAY_SPEC = importlib.util.spec_from_file_location("panda_hardware_replay", REPLAY_SCRIPT)
+assert REPLAY_SPEC is not None and REPLAY_SPEC.loader is not None
+REPLAY_MODULE = importlib.util.module_from_spec(REPLAY_SPEC)
+sys.modules[REPLAY_SPEC.name] = REPLAY_MODULE
+REPLAY_SPEC.loader.exec_module(REPLAY_MODULE)
+
 EXAMPLE_CONFIG = Path(__file__).parents[2] / "examples" / "panda" / "panda_hardware_session.example.json"
+LAB_CONFIG = Path(__file__).parents[2] / "examples" / "panda" / "panda_hardware_session.lab.json"
 
 
 def make_args(tmp_path: Path, **overrides):
@@ -62,6 +70,7 @@ def make_args(tmp_path: Path, **overrides):
         "tool_box_min": [-0.05, -0.05, -0.15],
         "tool_box_max": [0.05, 0.05, 0.02],
         "joint_limit_margin_deg": 5.0,
+        "home_joints_deg": [0.0, -45.0, 0.0, -135.0, 0.0, 90.0, 0.0],
         "tcp_translation": [0.0, 0.0, 0.15],
         "tcp_quaternion": [0.0, 0.0, 0.0, 1.0],
         "cameras": {"wrist": "WRIST-SERIAL", "third_person": "THIRD-SERIAL"},
@@ -88,6 +97,14 @@ def test_keyboard_mapping_and_action_shape():
     np.testing.assert_allclose(MODULE.accumulated_offset(offset, "q", 0.005), offset)
 
 
+def test_control_command_success_rate_handles_missing_and_nonfinite_values():
+    assert MODULE.control_command_success_rate({}) is None
+    observation = {"right": {"robot_state": {"control_command_success_rate": 0.97}}}
+    assert MODULE.control_command_success_rate(observation) == pytest.approx(0.97)
+    observation["right"]["robot_state"]["control_command_success_rate"] = np.nan
+    assert MODULE.control_command_success_rate(observation) is None
+
+
 def test_robotiq_hardware_creator_uses_configured_gripper_type_id():
     from rcs._core.common import GripperType
     from rcs_panda.creators import HARDWARE_GRIPPER_CREATORS
@@ -107,6 +124,122 @@ def test_cartesian_hold_action_commands_zero_motion():
     np.testing.assert_allclose(HOLD_MODULE.hold_action()["tquat"], [0, 0, 0, 0, 0, 0, 1])
     assert HOLD_MODULE.HOLD_SECONDS == 2.0
     assert HOLD_MODULE.MAX_DRIFT_METERS == 0.001
+
+
+def test_hardware_replay_quaternion_angle_ignores_sign():
+    identity = np.array([0.0, 0.0, 0.0, 1.0])
+    assert REPLAY_MODULE.quaternion_angle_degrees(identity, -identity) == pytest.approx(0.0)
+    quarter_turn = np.array([0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)])
+    assert REPLAY_MODULE.quaternion_angle_degrees(identity, quarter_turn) == pytest.approx(90.0)
+
+
+def test_hardware_replay_target_uses_configured_origin():
+    origin = np.array([0.4, -0.1, 0.5, 0.0, 0.0, 0.0, 1.0])
+    relative = np.array([0.01, 0.02, -0.03, 0.0, 0.0, 0.0, 1.0])
+    target = REPLAY_MODULE.target_tquat_from_origin(origin, relative)
+    np.testing.assert_allclose(target, [0.41, -0.08, 0.47, 0.0, 0.0, 0.0, 1.0])
+
+
+def make_replay_episode(
+    timestamps: list[float],
+    *,
+    gripper_change_step: int | None = None,
+    success: bool = False,
+    control_rates: list[float] | None = None,
+):
+    rates = control_rates or [1.0] * len(timestamps)
+    steps = []
+    for index, (timestamp, rate) in enumerate(zip(timestamps, rates)):
+        gripper = 0 if gripper_change_step is not None and index >= gripper_change_step else 1
+        steps.append(
+            REPLAY_MODULE.ReplayStep(
+                step=index,
+                timestamp=timestamp,
+                action={"right": {"tquat": [0, 0, 0, 0, 0, 0, 1], "gripper": [gripper]}},
+                recorded_tquat=np.array([0, 0, 0, 0, 0, 0, 1], dtype=float),
+                recorded_target_tquat=np.array([0, 0, 0, 0, 0, 0, 1], dtype=float),
+                recorded_joints=np.zeros(7),
+                joint_collision=np.zeros(7),
+                cartesian_collision=np.zeros(6),
+                success=success and index == len(timestamps) - 1,
+                frame_timestamp=timestamp,
+                camera_available=True,
+                control_command_success_rate=rate,
+            )
+        )
+    return REPLAY_MODULE.Episode("test", "pick", steps)
+
+
+def test_hardware_replay_validates_real_timing_and_post_gripper_tail():
+    metadata = {"frequency": 10, "cameras": {"third_person": "serial"}}
+    valid = make_replay_episode([index * 0.1 for index in range(21)], gripper_change_step=5, success=True)
+    REPLAY_MODULE.validate_episode_timing(valid, metadata)
+
+    wrong_rate = make_replay_episode([index * 0.03 for index in range(21)])
+    with pytest.raises(ValueError, match="does not match metadata"):
+        REPLAY_MODULE.validate_episode_timing(wrong_rate, metadata)
+
+    no_tail = make_replay_episode([index * 0.1 for index in range(21)], gripper_change_step=20, success=True)
+    with pytest.raises(ValueError, match="after its last gripper command"):
+        REPLAY_MODULE.validate_episode_timing(no_tail, metadata)
+
+
+def test_hardware_replay_rejects_sustained_low_control_success_rate():
+    metadata = {"frequency": 10, "cameras": {}}
+    rates = [1.0] * 5 + [0.8] * 10 + [1.0] * 6
+    episode = make_replay_episode([index * 0.1 for index in range(21)], control_rates=rates)
+    with pytest.raises(ValueError, match="control command success rate"):
+        REPLAY_MODULE.validate_episode_timing(episode, metadata)
+
+
+def test_hardware_replay_requires_matching_session_metadata():
+    config = {
+        "robot_ip": "192.168.4.100",
+        "gripper_serial": "TEST-SERIAL",
+        "frequency": 20,
+        "step": 0.001,
+        "workspace_min": [0.1, -0.4, -0.05],
+        "workspace_max": [0.85, 0.4, 0.95],
+        "tool_box_min": [-0.13, -0.13, -0.16],
+        "tool_box_max": [0.13, 0.13, 0.04],
+        "home_joints_deg": [0.0, -24.0, 0.0, -142.0, 0.0, 122.0, 0.0],
+        "tcp_translation": [0.0, 0.0, 0.1493],
+        "tcp_quaternion": [0.0, 0.0, 0.0, 1.0],
+    }
+    metadata = {
+        "robot_ip": "192.168.4.100",
+        "gripper_serial": "TEST-SERIAL",
+        "frequency": 20,
+        "step_meters": 0.001,
+        "workspace_min": [0.1, -0.4, -0.05],
+        "workspace_max": [0.85, 0.4, 0.95],
+        "tool_box_min_tcp_frame": [-0.13, -0.13, -0.16],
+        "tool_box_max_tcp_frame": [0.13, 0.13, 0.04],
+        "home_joints_deg": [0.0, -24.0, 0.0, -142.0, 0.0, 122.0, 0.0],
+        "flange_to_tcp_translation_m": [0.0, 0.0, 0.1493],
+        "flange_to_tcp_quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+    }
+    REPLAY_MODULE.validate_metadata(config, metadata)
+    config["step"] = 0.002
+    REPLAY_MODULE.validate_metadata(config, metadata)
+    metadata["frequency"] = 30
+    with pytest.raises(ValueError, match="frequency"):
+        REPLAY_MODULE.validate_metadata(config, metadata)
+
+
+def test_hardware_replay_rejects_unsafe_recorded_step():
+    episode = make_replay_episode([index * 0.1 for index in range(21)])
+    metadata = {
+        "frequency": 10,
+        "cameras": {},
+        "workspace_min": [-1.0, -1.0, -1.0],
+        "workspace_max": [1.0, 1.0, 1.0],
+        "tool_box_min_tcp_frame": [-0.1, -0.1, -0.1],
+        "tool_box_max_tcp_frame": [0.1, 0.1, 0.1],
+        "step_meters": 0.006,
+    }
+    with pytest.raises(ValueError, match="recorded step_meters"):
+        REPLAY_MODULE.validate_episode(episode, metadata)
 
 
 def test_franka_hand_defaults_are_required_before_motion():
@@ -208,6 +341,12 @@ def test_joint_margin_and_collision_report():
     limits = np.vstack((-np.ones(7), np.ones(7)))
     assert MODULE.joints_have_margin(np.zeros(7), limits, 0.1)
     assert not MODULE.joints_have_margin(np.array([0.95, 0, 0, 0, 0, 0, 0]), limits, 0.1)
+    assert MODULE.joint_margin_violations(
+        np.array([0.95, 0, 0, 0, 0, 0, -0.95]), limits, 0.1
+    ) == [
+        "J1=54.43 deg (safe -51.57..51.57 deg)",
+        "J7=-54.43 deg (safe -51.57..51.57 deg)",
+    ]
     obs = {
         "right": {
             "robot_state": {
@@ -217,6 +356,35 @@ def test_joint_margin_and_collision_report():
         }
     }
     assert MODULE.collision_report(obs) == ["joint_collision=[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]"]
+
+
+def test_lab_home_tool_envelope_is_inside_workspace():
+    import rcs
+    from rcs import common
+    from rcs._core.common import RobotType
+
+    config = json.loads(LAB_CONFIG.read_text(encoding="utf-8"))
+    home = np.deg2rad(config["home_joints_deg"])
+    tcp_offset = common.Pose(
+        translation=np.asarray(config["tcp_translation"], dtype=float),
+        quaternion=np.asarray(config["tcp_quaternion"], dtype=float),
+    )
+    kinematics = common.Pin(rcs.ROBOTS[RobotType.Panda].mjcf_model_path, "attachment")
+    home_pose = kinematics.forward(home, tcp_offset)
+    np.testing.assert_allclose(home_pose.translation(), [0.405322, 0.0, 0.599659], atol=1e-5)
+    # The hardware config currently reports a conservative J4 safe lower bound
+    # of about -155.4 degrees after the configured two-degree margin.
+    assert config["home_joints_deg"][3] > -145.0
+    assert MODULE.home_path_within_workspace(
+        kinematics,
+        home,
+        home,
+        tcp_offset,
+        np.asarray(config["tool_box_min"], dtype=float),
+        np.asarray(config["tool_box_max"], dtype=float),
+        np.asarray(config["workspace_min"], dtype=float),
+        np.asarray(config["workspace_max"], dtype=float),
+    )
 
 
 def test_safety_arguments_accept_new_absolute_output(tmp_path):
@@ -244,6 +412,7 @@ def test_safety_arguments_accept_new_absolute_output(tmp_path):
         ({"workspace_min": [0.8, 0, 0]}, "workspace minimum"),
         ({"tool_box_min": [0.01, -0.1, -0.1]}, "tool box"),
         ({"joint_limit_margin_deg": 21.0}, "joint-limit-margin"),
+        ({"home_joints_deg": [0.0] * 6}, "home-joints-deg"),
         ({"cameras": {"wrist": "ONLY"}}, "third_person"),
         ({"camera_fps": 61}, "camera-fps"),
         ({"tcp_quaternion": [0, 0, 0, 2]}, "normalized"),
