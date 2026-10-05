@@ -74,8 +74,11 @@ sudo examples/panda/panda_realtime_tune.sh 192.168.178.12
 ```
 
 它通过内核 sysfs 把每个 CPU governor 切到 `performance`（不依赖与实时内核版本匹配的
-`cpupower` 包），并关闭通往 Panda 的有线网卡 GRO；通常重启后恢复系统默认值。不要在
-机器人运动期间修改这些设置。
+`cpupower` 包），关闭通往 Panda 的有线网卡 GRO，并暂停 `irqbalance`、把 Panda 网卡中断
+固定到本实验室主机负载较低的 CPU5，避免 1 kHz FCI 收包与 CPU0 housekeeping 竞争。
+通常重启后恢复系统默认值；也可以用 `sudo systemctl start irqbalance` 恢复动态中断分配。
+不要在机器人运动期间修改这些设置。其他主机应先检查 CPU 拓扑，再用第二个参数覆盖 IRQ
+CPU，例如 `sudo examples/panda/panda_realtime_tune.sh 192.168.178.12 5`。
 
 ### 回放刚采集的一条数据
 
