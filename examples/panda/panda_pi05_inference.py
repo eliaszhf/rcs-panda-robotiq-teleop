@@ -160,6 +160,7 @@ def create_joint_hardware_env(config: dict[str, Any]):
                 "enable_ir_emitter": False,
                 "enable_ir": False,
                 "enable_imu": False,
+                "enable_depth": False,
                 "align_depth_to_color": False,
             },
         )

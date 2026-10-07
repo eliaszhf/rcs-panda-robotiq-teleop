@@ -131,7 +131,9 @@ The exact state-check and collection commands should be assembled only after
 the checklist has been reviewed. The collector requires a new absolute output
 directory and refuses to overwrite or append to an existing session. Keyboard
 controls are W/S, A/D, R/F, Q/E, T=start recording, Y=finish success,
-N=finish failure and Escape=exit. After a libfranka
+N=finish failure and Escape=exit. Y and N flush the episode and then close the
+camera and hardware environment so resources cannot accumulate between runs.
+After a libfranka
 `communication_constraints_violation`, recording stops and movement input is
 disabled. With the complete Home path clear, R performs error recovery and a
 low-speed Home motion; T can then start a fresh recording UUID. R remains the

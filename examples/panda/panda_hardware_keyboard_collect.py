@@ -35,6 +35,7 @@ MIN_POST_GRIPPER_RECORD_SECONDS = 1.0
 MIN_CONTROL_COMMAND_SUCCESS_RATE = 0.9
 MAX_LOW_CONTROL_SECONDS = 1.0
 RECORD_BATCH_SECONDS = 5
+STATUS_PRINT_INTERVAL_SECONDS = 1.0
 CONFIRM_PREFIX = "ENABLE-REAL-PANDA"
 HOME_CONFIRM_PREFIX = "MOVE-HOME"
 HOME_PATH_SAMPLES = 101
@@ -470,6 +471,7 @@ def create_hardware_env(robot_ip: str, gripper_serial: str, args: argparse.Names
                     "enable_ir_emitter": False,
                     "enable_ir": False,
                     "enable_imu": False,
+                    "enable_depth": args.include_depth,
                     "align_depth_to_color": args.include_depth,
                 },
             )
@@ -884,6 +886,10 @@ def main() -> None:
                         episode_finished = True
                         print("RECORDING STOPPED: FAILURE")
 
+                if episode_finished:
+                    print("Episode finished; closing camera and hardware resources.")
+                    break
+
                 delta = delta_for_key(key, args.step)
                 if delta is not None:
                     proposed_offset = accumulated_offset(command_offset, key, args.step)
@@ -940,7 +946,9 @@ def main() -> None:
                         f"{MAX_LOW_CONTROL_SECONDS:.1f} s (latest={success_rate:.3f})"
                     )
                 now = time.monotonic()
-                if (key in KEY_DELTAS or key in {"q", "e"}) and now - last_status_print >= 0.2:
+                if (
+                    key in KEY_DELTAS or key in {"q", "e"}
+                ) and now - last_status_print >= STATUS_PRINT_INTERVAL_SECONDS:
                     print(
                         f"key={key} target_offset={command_offset} TCP={current_tcp} "
                         f"gripper={observation['right']['gripper']} "

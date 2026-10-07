@@ -41,12 +41,14 @@ class RealSenseCameraSet(HardwareCamera):
         enable_ir: bool = False,
         laser_power: int = 330,
         enable_imu: bool = False,
+        enable_depth: bool = True,
         align_depth_to_color: bool = False,
     ) -> None:
         self.enable_ir_emitter = enable_ir_emitter
         self.enable_ir = enable_ir
         self.laser_power = laser_power
         self.enable_imu = enable_imu
+        self.enable_depth = enable_depth
         self.cameras = cameras
         self.align_depth_to_color = align_depth_to_color
         if calibration_strategy is None:
@@ -66,13 +68,14 @@ class RealSenseCameraSet(HardwareCamera):
         self._frame_buffer: dict[str, list] = {}
 
         self.D400_config = rs.config()
-        self.D400_config.enable_stream(
-            rs.stream.depth,
-            self.resolution_width,
-            self.resolution_height,
-            rs.format.z16,
-            self.frame_rate,
-        )
+        if self.enable_depth:
+            self.D400_config.enable_stream(
+                rs.stream.depth,
+                self.resolution_width,
+                self.resolution_height,
+                rs.format.z16,
+                self.frame_rate,
+            )
         self.D400_config.enable_stream(
             rs.stream.color,
             self.resolution_width,
@@ -167,7 +170,8 @@ class RealSenseCameraSet(HardwareCamera):
             # 640x480 mode and align it to the configured color resolution.
             d400_config = rs.config()
             d400_config.enable_device(device_info.serial)
-            d400_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, self.frame_rate)
+            if self.enable_depth:
+                d400_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, self.frame_rate)
             d400_config.enable_stream(
                 rs.stream.color,
                 self.resolution_width,
@@ -187,7 +191,8 @@ class RealSenseCameraSet(HardwareCamera):
             # aligned below, librealsense resamples it into the color frame.
             l500_config = rs.config()
             l500_config.enable_device(device_info.serial)
-            l500_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, self.frame_rate)
+            if self.enable_depth:
+                l500_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, self.frame_rate)
             l500_config.enable_stream(
                 rs.stream.color,
                 self.resolution_width,
@@ -203,12 +208,6 @@ class RealSenseCameraSet(HardwareCamera):
             raise RuntimeError(msg)
 
         # Set the acquisition parameters
-        sensor = pipeline_profile.get_device().first_depth_sensor()
-        if sensor.supports(rs.option.emitter_enabled):
-            sensor.set_option(rs.option.emitter_enabled, 1 if enable_ir_emitter else 0)
-            sensor.set_option(rs.option.laser_power, self.laser_power)
-
-        depth_vp = pipeline_profile.get_stream(rs.stream.depth).as_video_stream_profile()
         color_vp = pipeline_profile.get_stream(rs.stream.color).as_video_stream_profile()
 
         rs_color_intrinsics = color_vp.get_intrinsics()
@@ -219,27 +218,39 @@ class RealSenseCameraSet(HardwareCamera):
                 [0, 0, 1, 0],
             ]
         )
-        rs_depth_intrinsics = depth_vp.get_intrinsics()
-        depth_intrinsics = np.array(
-            [
-                [rs_depth_intrinsics.fx, 0, (rs_depth_intrinsics.width - 1) / 2, 0],
-                [0, rs_depth_intrinsics.fy, (rs_depth_intrinsics.height - 1) / 2, 0],
-                [0, 0, 1, 0],
-            ]
-        )
-
-        depth_to_color = depth_vp.get_extrinsics_to(color_vp)
+        depth_scale = None
+        depth_intrinsics = None
+        depth_to_color_pose = None
+        if self.enable_depth:
+            sensor = pipeline_profile.get_device().first_depth_sensor()
+            if sensor.supports(rs.option.emitter_enabled):
+                sensor.set_option(rs.option.emitter_enabled, 1 if enable_ir_emitter else 0)
+                if enable_ir_emitter and sensor.supports(rs.option.laser_power):
+                    sensor.set_option(rs.option.laser_power, self.laser_power)
+            depth_vp = pipeline_profile.get_stream(rs.stream.depth).as_video_stream_profile()
+            rs_depth_intrinsics = depth_vp.get_intrinsics()
+            depth_intrinsics = np.array(
+                [
+                    [rs_depth_intrinsics.fx, 0, (rs_depth_intrinsics.width - 1) / 2, 0],
+                    [0, rs_depth_intrinsics.fy, (rs_depth_intrinsics.height - 1) / 2, 0],
+                    [0, 0, 1, 0],
+                ]
+            )
+            depth_to_color = depth_vp.get_extrinsics_to(color_vp)
+            depth_to_color_pose = common.Pose(
+                translation=depth_to_color.translation,
+                rotation=np.array(depth_to_color.rotation).reshape(3, 3),
+            )
+            depth_scale = sensor.get_depth_scale()
 
         self._enabled_devices[camera_name] = RealSenseDevicePipeline(
             pipeline,
             pipeline_profile,
             device_info,
-            depth_scale=sensor.get_depth_scale(),
+            depth_scale=depth_scale,
             color_intrinsics=color_intrinsics,  # type: ignore
             depth_intrinsics=depth_intrinsics,  # type: ignore
-            depth_to_color=common.Pose(
-                translation=depth_to_color.translation, rotation=np.array(depth_to_color.rotation).reshape(3, 3)  # type: ignore
-            ),
+            depth_to_color=depth_to_color_pose,
         )
 
         self._frame_buffer[camera_name] = []
@@ -280,7 +291,7 @@ class RealSenseCameraSet(HardwareCamera):
         streams = device.pipeline_profile.get_streams()
         frameset = device.pipeline.wait_for_frames()
 
-        if self.align_depth_to_color:
+        if self.enable_depth and self.align_depth_to_color:
             # replaces the frameset with a composite frameset containing the aligned depth
             align = rs.align(rs.stream.color)
             frameset = align.process(frameset)
@@ -300,11 +311,13 @@ class RealSenseCameraSet(HardwareCamera):
 
         color_extrinsics = self.calibration_strategy[camera_name].get_extrinsics()
 
-        if self.align_depth_to_color:
+        depth_extrinsics = None
+        active_depth_intrinsics = None
+        if self.enable_depth and self.align_depth_to_color:
             # if aligned, depth acts as if it was shot from the color sensor
             depth_extrinsics = color_extrinsics
             active_depth_intrinsics = device.color_intrinsics
-        else:
+        elif self.enable_depth:
             depth_to_color = device.depth_to_color
             assert depth_to_color is not None, "Depth to color extrinsics not found"
             depth_extrinsics = (

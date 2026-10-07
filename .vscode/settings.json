@@ -1,0 +1,28 @@
+{
+  "files.watcherExclude": {
+    "**/data/**": true,
+    "**/build/**": true,
+    "**/build_*/**": true,
+    "**/.git/objects/**": true,
+    "**/__pycache__/**": true,
+    "**/.pytest_cache/**": true
+  },
+  "search.exclude": {
+    "**/data/**": true,
+    "**/build/**": true,
+    "**/build_*/**": true,
+    "**/__pycache__/**": true,
+    "**/.pytest_cache/**": true
+  },
+  "python.analysis.exclude": [
+    "**/data/**",
+    "**/build/**",
+    "**/build_*/**"
+  ],
+  "python.analysis.diagnosticMode": "openFilesOnly",
+  "terminal.integrated.scrollback": 1000,
+  "terminal.integrated.persistentSessionScrollback": 100,
+  "terminal.integrated.enablePersistentSessions": false,
+  "terminal.integrated.gpuAcceleration": "off",
+  "terminal.integrated.shellIntegration.enabled": false
+}
