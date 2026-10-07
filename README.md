@@ -3,10 +3,9 @@
 > 仅用于真机。运行前必须确认：realtime 内核已激活、机械臂和夹爪周围净空、
 > 急停可用、Robotiq 和配置中的 RealSense 已连接，以及 Panda 已解锁并激活 FCI。
 
-完整流程（含代码下载、采集、校验和服务器上传）见
-[`examples/panda/TELEOP_DATA_COLLECTION_ZH.md`](examples/panda/TELEOP_DATA_COLLECTION_ZH.md)。
-服务器训练完成后的远程 π0.5 推理与单臂 Panda 部署见
-[`examples/panda/PI05_REMOTE_DEPLOYMENT_ZH.md`](examples/panda/PI05_REMOTE_DEPLOYMENT_ZH.md)。
+Panda 示例和硬件准备说明见 [`examples/panda/README.md`](examples/panda/README.md)；服务器端
+π0.5 转换、训练和服务流程见
+[`deployment/pi05_server/README.md`](deployment/pi05_server/README.md)。
 
 每次采集新 episode 时，只需先把 `TASK_INSTRUCTION` 改成本次的真实任务描述，再复制运行整段命令：
 
@@ -30,20 +29,9 @@ python examples/panda/panda_hardware_keyboard_collect.py \
   --instruction "$TASK_INSTRUCTION" \
   --output "$RUN_DIR" \
   --confirm "ENABLE-REAL-PANDA 192.168.178.12"
-
-START 192.168.178.12
-MOVE-HOME 192.168.178.12
-
-
-# 采集结束后立即离线校验刚才的数据；该命令不会连接或驱动机械臂
-python examples/panda/panda_hardware_replay.py \
-  --dataset "$RUN_DIR" \
-  --config examples/panda/panda_hardware_session.lab.json
 ```
 
-
-
-首次确认提示后，输入 `START 192.168.178.12`。硬件连接并完成路径预检后，程序会显示
+程序首次提示后输入 `START 192.168.178.12`。硬件连接并完成路径预检后，程序会显示
 固定 Home 的七个关节角；确认机械臂到 Home 的路径净空并且急停触手可及，再输入
 `MOVE-HOME 192.168.178.12`。机械臂低速到达固定 Home 后：
 
@@ -76,8 +64,17 @@ python examples/panda/panda_hardware_replay.py \
 只有通信中止等待恢复时才作为 Home 恢复键。碰撞、关节边界或工作空间等其他安全错误不会
 启用快捷恢复，必须退出并排查原因。
 
-恢复后的输出目录会同时包含失败 UUID 和新 UUID，因此离线校验时按终端显示的新 UUID 加上
-`--uuid <新UUID>`；不带该参数时，校验器会列出目录里的所有 UUID 供选择。
+恢复后的输出目录会同时包含失败 UUID 和新 UUID，因此离线校验时必须用 `--uuid`
+指定终端显示的新 UUID；不带 `--uuid` 时，校验器会列出目录里的所有 UUID 并停止，避免误校验
+失败轨迹。先把终端显示的新 UUID 填入第一行：
+
+```bash
+RECOVERED_UUID="把 RECOVERY HOME COMPLETE 后显示的新 UUID 填在这里"
+python examples/panda/panda_hardware_replay.py \
+  --dataset "$RUN_DIR" \
+  --config examples/panda/panda_hardware_session.lab.json \
+  --uuid "$RECOVERED_UUID"
+```
 
 每次运行必须使用新的输出目录；上面的时间戳命令会自动创建新目录。
 采集状态最多每秒打印一次；VS Code 工作区同时限制了终端回滚行数，并排除了旧数据和构建目录
@@ -127,16 +124,18 @@ CPU，例如 `sudo examples/panda/panda_realtime_tune.sh 192.168.178.12 5`。
 
 ```bash
 python examples/panda/panda_hardware_replay.py \
-  --dataset /home/haifeng/robot-data/panda/episode_20261001_124135 \
+  --dataset "$RUN_DIR" \
   --config examples/panda/panda_hardware_session.lab.json
 ```
+
+普通采集目录只有一个 UUID，不需要 `--uuid`；发生通信恢复后按上文指定新 UUID。
 
 只有 dry-run 显示 `VALID` 后，重新摆好物体、确认整条轨迹净空，并保持急停可用，才可
 显式开启真机回放：
 
 ```bash
 python examples/panda/panda_hardware_replay.py \
-  --dataset /home/haifeng/robot-data/panda/episode_20261001_124135 \
+  --dataset "$RUN_DIR" \
   --config examples/panda/panda_hardware_session.lab.json \
   --execute \
   --confirm "REPLAY-REAL-PANDA 192.168.178.12"
