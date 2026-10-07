@@ -40,6 +40,7 @@ HOME_CONFIRM_PREFIX = "MOVE-HOME"
 HOME_PATH_SAMPLES = 101
 HOME_TOLERANCE_DEG = 1.0
 DESK_END_EFFECTOR_PRESET = "Franka Hand"
+COMMUNICATION_CONSTRAINTS_ERROR = "communication_constraints_violation"
 FRANKA_HAND_MASS_KG = 0.73
 FRANKA_HAND_COM_M = np.array([-0.01, 0.0, 0.03])
 FRANKA_HAND_INERTIA_KG_M2 = np.diag([0.001, 0.0025, 0.0017])
@@ -115,6 +116,19 @@ def control_command_success_rate(observation: dict) -> float | None:
         return None
     rate = float(value)
     return rate if np.isfinite(rate) else None
+
+
+def is_recoverable_communication_stop(truncated: bool, info: Mapping[str, Any]) -> bool:
+    """Return whether a stopped control session may wait for operator recovery."""
+    if not truncated:
+        return False
+    errors = [info.get("franka_control_error", "")]
+    errors.extend(
+        robot_info.get("franka_control_error", "")
+        for robot_info in info.values()
+        if isinstance(robot_info, Mapping)
+    )
+    return any(COMMUNICATION_CONSTRAINTS_ERROR in str(error) for error in errors)
 
 
 def workspace_allows(
@@ -734,23 +748,105 @@ def main() -> None:
             f"held-key maximum: {args.step * args.frequency * 1000:.1f} mm/s"
         )
         print("T start recording, Y finish SUCCESS, N finish FAILURE, ESC exit")
+        print("After a communication stop only: press R to recover and move Home")
         with raw_terminal():
             next_tick = time.monotonic()
             last_status_print = 0.0
             last_gripper_change = float("-inf")
             low_control_ticks = 0
+            recovery_required = False
             while True:
-                timeout = max(0.0, next_tick - time.monotonic())
+                timeout = (
+                    0.1 if recovery_required else max(0.0, next_tick - time.monotonic())
+                )
                 keys = read_pending_keys(sys.stdin.fileno(), timeout)
                 # select() returns immediately when a key is buffered. Still
                 # wait for the scheduled deadline so held keys cannot make the
                 # control/data loop run at the keyboard repeat or camera rate.
                 remaining = next_tick - time.monotonic()
-                if remaining > 0.0:
+                if not recovery_required and remaining > 0.0:
                     time.sleep(remaining)
 
                 if "\x1b" in keys:
                     break
+
+                if recovery_required:
+                    if "r" not in keys:
+                        continue
+                    print("RECOVERY REQUESTED: keep the entire Home path clear.")
+                    recovery_joints = np.asarray(observation["right"]["joints"], dtype=float)
+                    recovery_collisions = collision_report(observation)
+                    if recovery_collisions:
+                        print(
+                            "RECOVERY BLOCKED: collision signal is still asserted: "
+                            + "; ".join(recovery_collisions)
+                        )
+                        continue
+                    if not joints_have_margin(recovery_joints, joint_limits, joint_margin):
+                        print(
+                            "RECOVERY BLOCKED: current joints are inside the configured limit margin"
+                        )
+                        continue
+                    if not home_path_within_workspace(
+                        kinematics,
+                        recovery_joints,
+                        home_joints,
+                        robot.get_config().tcp_offset,
+                        tool_box_min,
+                        tool_box_max,
+                        workspace_min,
+                        workspace_max,
+                    ):
+                        print("RECOVERY BLOCKED: sampled path to Home leaves the workspace")
+                        continue
+
+                    try:
+                        # reset() joins the failed controller, performs Franka
+                        # recovery, and clears its stored background exception.
+                        robot.reset()
+                        robot.move_home()
+                        # Start a fresh StorageWrapper UUID. The failed UUID
+                        # remains unsuccessful and cannot merge with this run.
+                        observation, info = recorder.reset()
+                    except Exception as error:
+                        print(f"RECOVERY FAILED: {error}")
+                        print("Resolve the Panda/Desk error, then press R to retry or ESC to exit.")
+                        continue
+
+                    measured_home = np.asarray(observation["right"]["joints"], dtype=float)
+                    if not np.allclose(
+                        measured_home,
+                        home_joints,
+                        rtol=0.0,
+                        atol=np.deg2rad(HOME_TOLERANCE_DEG),
+                    ):
+                        print(
+                            "RECOVERY FAILED: Home tolerance check did not pass; "
+                            f"measured={np.rad2deg(measured_home)}"
+                        )
+                        recovery_required = True
+                        continue
+                    current_tquat = np.asarray(observation["right"]["tquat"], dtype=float)
+                    current_tcp = current_tquat[:3]
+                    session_origin_tquat = current_tquat.copy()
+                    command_offset = np.zeros(3, dtype=float)
+                    gripper_state = int(
+                        np.asarray(observation["right"]["gripper"], dtype=float).reshape(-1)[0]
+                        >= 0.5
+                    )
+                    last_gripper_change = float("-inf")
+                    low_control_ticks = 0
+                    episode_finished = False
+                    recovery_required = False
+                    # Home motion can take seconds. Discard buffered key-repeat
+                    # events so the recovery R cannot become a Z-up command.
+                    termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+                    next_tick = time.monotonic()
+                    print(
+                        "RECOVERY HOME COMPLETE. Fresh episode UUID: "
+                        f"{recorder.uuid.hex}. Press T to start recording."
+                    )
+                    continue
 
                 key = ""
                 for event in keys:
@@ -762,7 +858,7 @@ def main() -> None:
                         elif not recording:
                             recorder.start_record()
                             recording = True
-                            print("RECORDING STARTED")
+                            print(f"RECORDING STARTED uuid={recorder.uuid.hex}")
                     elif event in {"q", "e"}:
                         requested_gripper_state = 1 if event == "q" else 0
                         if requested_gripper_state != gripper_state:
@@ -851,6 +947,21 @@ def main() -> None:
                         f"recording={recording} reward={reward}"
                     )
                     last_status_print = now
+                if is_recoverable_communication_stop(truncated, info):
+                    print("Environment stopped:", info)
+                    if recording:
+                        recorder.stop_record()
+                        recording = False
+                        print("Active episode flushed as FAILURE/unfinished.")
+                    episode_finished = True
+                    recovery_required = True
+                    print(
+                        "COMMUNICATION STOP: robot control is stopped. "
+                        "Clear the Home path, then press R to recover Home; "
+                        "press ESC to exit."
+                    )
+                    next_tick = time.monotonic()
+                    continue
                 if terminated or truncated:
                     print("Environment stopped:", info)
                     break

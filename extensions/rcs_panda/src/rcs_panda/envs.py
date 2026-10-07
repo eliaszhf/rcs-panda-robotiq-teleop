@@ -24,7 +24,7 @@ class PandaHW(gym.Wrapper):
         except hw.exceptions.FrankaControlException as e:
             _logger.error("FrankaControlException: %s", e)
             self.hw_robot.automatic_error_recovery()
-            return self.get_obs(), 0, False, True, {}
+            return self.get_obs(), 0, False, True, {"franka_control_error": str(e)}
 
     def get_obs(self, obs: dict | None = None) -> dict[str, Any]:
         if obs is None:

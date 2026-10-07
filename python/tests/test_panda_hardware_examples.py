@@ -105,6 +105,19 @@ def test_control_command_success_rate_handles_missing_and_nonfinite_values():
     assert MODULE.control_command_success_rate(observation) is None
 
 
+def test_only_communication_constraint_truncation_is_operator_recoverable():
+    communication_info = {
+        "franka_control_error": "libfranka: motion aborted: communication_constraints_violation"
+    }
+    assert MODULE.is_recoverable_communication_stop(True, communication_info)
+    assert MODULE.is_recoverable_communication_stop(True, {"right": communication_info})
+    assert not MODULE.is_recoverable_communication_stop(False, communication_info)
+    assert not MODULE.is_recoverable_communication_stop(
+        True, {"franka_control_error": "joint_position_limits_violation"}
+    )
+    assert not MODULE.is_recoverable_communication_stop(True, {})
+
+
 def test_robotiq_hardware_creator_uses_configured_gripper_type_id():
     from rcs._core.common import GripperType
     from rcs_panda.creators import HARDWARE_GRIPPER_CREATORS

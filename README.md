@@ -68,6 +68,17 @@ python examples/panda/panda_hardware_replay.py \
 持续缓冲也不会让采集循环超过配置的 10 Hz。若 libfranka 的命令成功率连续约 1 秒低于
 0.90，程序会安全停止并把当前 episode 留作失败/未完成数据，不要用于训练。
 
+如果 libfranka 因 `communication_constraints_violation` 中止，程序现在不会退出：当前录制会
+立即作为失败/未完成 UUID 落盘，并停止接受移动键。确认机械臂到固定 Home 的整条路径净空后，
+按一次 `R` 执行错误恢复并低速回到 Home；显示 `RECOVERY HOME COMPLETE` 和新 UUID 后，再按
+`T` 会用该 UUID 开始全新录制，不会续接异常前的轨迹。正常遥操状态下 `R` 仍是基座 `z`
+正方向；
+只有通信中止等待恢复时才作为 Home 恢复键。碰撞、关节边界或工作空间等其他安全错误不会
+启用快捷恢复，必须退出并排查原因。
+
+恢复后的输出目录会同时包含失败 UUID 和新 UUID，因此离线校验时按终端显示的新 UUID 加上
+`--uuid <新UUID>`；不带该参数时，校验器会列出目录里的所有 UUID 供选择。
+
 每次运行必须使用新的输出目录；上面的时间戳命令会自动创建新目录。
 
 ### 上传已校验的数据

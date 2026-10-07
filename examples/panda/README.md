@@ -131,8 +131,15 @@ The exact state-check and collection commands should be assembled only after
 the checklist has been reviewed. The collector requires a new absolute output
 directory and refuses to overwrite or append to an existing session. Keyboard
 controls are W/S, A/D, R/F, Q/E, T=start recording, Y=finish success,
-N=finish failure and Escape=exit. One process records one episode; start a new
-process and output directory for the next episode.
+N=finish failure and Escape=exit. After a libfranka
+`communication_constraints_violation`, recording stops and movement input is
+disabled. With the complete Home path clear, R performs error recovery and a
+low-speed Home motion; T can then start a fresh recording UUID. R remains the
+normal positive-z key at all other times. Non-communication safety stops do not
+enable this recovery shortcut. A normal completed episode still requires a new
+process and output directory for the next episode. A recovered directory has
+both the failed and fresh UUID; pass the fresh UUID printed by the collector to
+the replay validator with `--uuid`.
 
 The collector accepts repeated `--camera NAME=SERIAL` options or a `cameras`
 mapping in JSON. By default it requires `wrist` and `third_person`, records RGB
