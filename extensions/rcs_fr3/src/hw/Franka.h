@@ -88,6 +88,11 @@ struct FrankaConfig : common::RobotConfig {
   Eigen::Vector3d kp_p = (Eigen::Vector3d() << 150., 150., 150.).finished();
   double kp_r = 250.0;
   std::optional<FrankaLoad> load_parameters = std::nullopt;
+  // Optional software-only gravity model for the complete physical assembly.
+  // The controller adds the difference between this model and the load model
+  // currently configured in the robot, without calling Robot::setLoad().
+  std::optional<double> gravity_compensation_total_mass = std::nullopt;
+  std::optional<Eigen::Vector3d> gravity_compensation_total_com = std::nullopt;
   std::optional<common::Pose> world_to_robot = std::nullopt;
   common::Pose tcp_offset = common::Pose::Identity();
   // Indicates that Cartesian control uses tcp_offset.

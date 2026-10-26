@@ -641,10 +641,29 @@ void Franka::osc() {
                        (Lambda_ori *
                         (Kp_r * ori_error - Kd_r * (jacobian_ori * dq)));
 
-      // libfranka torque commands include the model Coriolis term explicitly
-      // (as in its Cartesian impedance example).  It was calculated above but
-      // previously discarded, leaving the OSC with a systematic model error.
-      tau_d += coriolis;
+      // Keep model feedforward separate from feedback.  The configurable
+      // torque limit is a bound on active Cartesian/nullspace correction, not
+      // on the Coriolis and load compensation needed merely to hold the arm.
+      // Clipping their sum to +/-5 Nm can consume all control authority in an
+      // extended pose and produce a large, axis-dependent steady-state error.
+      Eigen::Matrix<double, 7, 1> feedforward_tau = coriolis;
+
+      // libfranka adds gravity for the load model configured in the robot to
+      // every external torque command.  When Desk cannot be changed, add only
+      // the difference to a script-configured model of the complete physical
+      // end-effector assembly.  This avoids double-counting the configured
+      // end effector and does not call Robot::setLoad().
+      if (this->m_cfg.gravity_compensation_total_mass.has_value() &&
+          this->m_cfg.gravity_compensation_total_com.has_value()) {
+        const std::array<double, 7> corrected_gravity_array = model.gravity(
+            robot_state.q,
+            this->m_cfg.gravity_compensation_total_mass.value(),
+            common::eigen2array<3, 1>(
+                this->m_cfg.gravity_compensation_total_com.value()));
+        const Eigen::Map<const Eigen::Matrix<double, 7, 1>> corrected_gravity(
+            corrected_gravity_array.data());
+        feedforward_tau += corrected_gravity - gravity;
+      }
 
       // nullspace control
       tau_d << tau_d + Nullspace * (static_q_task_ - q);
@@ -670,13 +689,19 @@ void Franka::osc() {
         if (dist2joint_min[i] < 0.1 && tau_d[i] < 0.) tau_d[i] = 0.;
       }
 
+      // Limit only the active feedback around the model feedforward center.
+      // This retains the original 5 Nm-per-joint correction envelope without
+      // truncating gravity/load support in poses where it is most needed.
+      std::array<double, 7> feedback_tau_array{};
+      Eigen::VectorXd::Map(&feedback_tau_array[0], 7) = tau_d;
+      TorqueSafetyGuardFn(feedback_tau_array, torque_limit);
+
       std::array<double, 7> tau_d_array{};
-      Eigen::VectorXd::Map(&tau_d_array[0], 7) = tau_d;
+      Eigen::VectorXd::Map(&tau_d_array[0], 7) =
+          Eigen::VectorXd::Map(feedback_tau_array.data(), 7) + feedforward_tau;
 
       std::array<double, 7> tau_d_rate_limited = franka::limitRate(
           franka::kMaxTorqueRate, tau_d_array, robot_state.tau_J_d);
-
-      TorqueSafetyGuardFn(tau_d_rate_limited, torque_limit);
 
       const auto callback_us = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(
@@ -733,7 +758,6 @@ void Franka::joint_controller() {
       std::chrono::high_resolution_clock::time_point t1 =
           std::chrono::high_resolution_clock::now();
 
-      // torques handler
       if (this->running_controller.load() == Controller::none) {
         return franka::MotionFinished(franka::Torques(robot_state.tau_J_d));
       }
@@ -746,47 +770,59 @@ void Franka::joint_controller() {
         this->controller_time += period.toSec();
         this->joint_interpolator.next_step(this->controller_time, desired_q);
       }
-      // end torques handler
 
       Eigen::Matrix<double, 7, 1> tau_d;
-
-      // Current joint velocity
       Eigen::Map<const Eigen::Matrix<double, 7, 1>> dq(robot_state.dq.data());
-
-      // Current joint position
       Eigen::Map<const Eigen::Matrix<double, 7, 1>> q(robot_state.q.data());
-
       Eigen::MatrixXd joint_pos_error(7, 1);
-
       joint_pos_error << desired_q - q;
-
       tau_d << Kp.cwiseProduct(joint_pos_error) - Kd.cwiseProduct(dq);
+
+      std::array<double, 7> coriolis_array = model.coriolis(robot_state);
+      Eigen::Map<const Eigen::Matrix<double, 7, 1>> coriolis(
+          coriolis_array.data());
+      Eigen::Matrix<double, 7, 1> feedforward_tau = coriolis;
+
+      if (this->m_cfg.gravity_compensation_total_mass.has_value() &&
+          this->m_cfg.gravity_compensation_total_com.has_value()) {
+        const std::array<double, 7> gravity_array = model.gravity(robot_state);
+        const Eigen::Map<const Eigen::Matrix<double, 7, 1>> gravity(
+            gravity_array.data());
+        const std::array<double, 7> corrected_gravity_array = model.gravity(
+            robot_state.q,
+            this->m_cfg.gravity_compensation_total_mass.value(),
+            common::eigen2array<3, 1>(
+                this->m_cfg.gravity_compensation_total_com.value()));
+        const Eigen::Map<const Eigen::Matrix<double, 7, 1>> corrected_gravity(
+            corrected_gravity_array.data());
+        feedforward_tau += corrected_gravity - gravity;
+      }
 
       Eigen::Matrix<double, 7, 1> dist2joint_max;
       Eigen::Matrix<double, 7, 1> dist2joint_min;
-
       dist2joint_max = joint_max_.matrix() - q;
       dist2joint_min = q - joint_min_.matrix();
-
       for (int i = 0; i < 7; i++) {
         if (dist2joint_max[i] < 0.1 && tau_d[i] > 0.) tau_d[i] = 0.;
         if (dist2joint_min[i] < 0.1 && tau_d[i] < 0.) tau_d[i] = 0.;
       }
 
-      std::array<double, 7> tau_d_array{};
-      Eigen::VectorXd::Map(&tau_d_array[0], 7) = tau_d;
+      std::array<double, 7> feedback_tau_array{};
+      Eigen::VectorXd::Map(&feedback_tau_array[0], 7) = tau_d;
+      TorqueSafetyGuardFn(feedback_tau_array, torque_limit);
 
-      // end of controller
+      std::array<double, 7> tau_d_array{};
+      Eigen::VectorXd::Map(&tau_d_array[0], 7) =
+          Eigen::VectorXd::Map(feedback_tau_array.data(), 7) + feedforward_tau;
+
       std::chrono::high_resolution_clock::time_point t2 =
           std::chrono::high_resolution_clock::now();
       auto time =
           std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
+      (void)time;
 
       std::array<double, 7> tau_d_rate_limited = franka::limitRate(
           franka::kMaxTorqueRate, tau_d_array, robot_state.tau_J_d);
-
-      TorqueSafetyGuardFn(tau_d_rate_limited, torque_limit);
-
       return tau_d_rate_limited;
     });
   } catch (...) {

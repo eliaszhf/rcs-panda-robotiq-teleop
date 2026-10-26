@@ -118,6 +118,8 @@ class FrankaConfig(rcs._core.common.RobotConfig):
     kp_p: numpy.ndarray[tuple[typing.Literal[3]], numpy.dtype[numpy.float64]]
     kp_r: float
     load_parameters: FrankaLoad | None
+    gravity_compensation_total_mass: float | None
+    gravity_compensation_total_com: numpy.ndarray[tuple[typing.Literal[3]], numpy.dtype[numpy.float64]] | None
     policy_rate: int
     speed_factor: float
     tcp_offset: rcs._core.common.Pose

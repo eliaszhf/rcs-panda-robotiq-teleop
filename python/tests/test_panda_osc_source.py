@@ -13,12 +13,25 @@ def test_osc_uses_starting_joint_state_as_nullspace_target() -> None:
     assert "static_q_task_ << 0.09017809387254755" not in source
 
 
-def test_osc_adds_model_coriolis_before_safety_limiting() -> None:
+def test_osc_limits_feedback_around_model_feedforward() -> None:
     source = FRANKA_SOURCE.read_text(encoding="utf-8")
 
-    coriolis_add = source.index("tau_d += coriolis;")
-    torque_limit = source.index("TorqueSafetyGuardFn(tau_d_rate_limited, torque_limit);", coriolis_add)
-    assert coriolis_add < torque_limit
+    osc_source = source[source.index("void Franka::osc()") : source.index("void Franka::joint_controller()")]
+    feedforward = osc_source.index("feedforward_tau = coriolis")
+    feedback_limit = osc_source.index("TorqueSafetyGuardFn(feedback_tau_array, torque_limit)")
+    total_torque = osc_source.index("feedback_tau_array.data(), 7) + feedforward_tau")
+
+    assert feedforward < feedback_limit < total_torque
+    assert "TorqueSafetyGuardFn(tau_d_rate_limited, torque_limit)" not in osc_source
+
+
+def test_osc_can_add_software_only_gravity_model_difference() -> None:
+    source = FRANKA_SOURCE.read_text(encoding="utf-8")
+
+    assert "gravity_compensation_total_mass" in source
+    assert "gravity_compensation_total_com" in source
+    assert "corrected_gravity - gravity" in source
+    assert "robot.setLoad(" not in source[source.index("void Franka::osc()") :]
 
 
 def test_realtime_callbacks_do_not_block_on_shared_state_or_interpolator() -> None:
@@ -41,3 +54,20 @@ def test_osc_reports_realtime_timing_after_control_stops() -> None:
     assert "robot_period_over_1500us" in source
     assert "state_store_skips" in source
     assert "target_lock_skips" in source
+
+
+def test_joint_stream_uses_repository_torque_controller() -> None:
+    source = FRANKA_SOURCE.read_text(encoding="utf-8")
+    joint_source = source[
+        source.index("void Franka::joint_controller()") : source.index(
+            "void Franka::zero_torque_guiding()"
+        )
+    ]
+
+    assert "-> franka::Torques" in joint_source
+    assert "Kp.cwiseProduct" in joint_source
+    assert "feedforward_tau = coriolis" in joint_source
+    assert "corrected_gravity - gravity" in joint_source
+    assert "TorqueSafetyGuardFn(feedback_tau_array, torque_limit)" in joint_source
+    assert "TorqueSafetyGuardFn(tau_d_rate_limited, torque_limit)" not in joint_source
+    assert "-> franka::JointPositions" not in joint_source

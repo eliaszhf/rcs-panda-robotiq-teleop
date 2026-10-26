@@ -137,6 +137,10 @@ PYBIND11_MODULE(_core, m) {
       .def_readwrite("kp_p", &rcs::hw::FrankaConfig::kp_p)
       .def_readwrite("kp_r", &rcs::hw::FrankaConfig::kp_r)
       .def_readwrite("load_parameters", &rcs::hw::FrankaConfig::load_parameters)
+      .def_readwrite("gravity_compensation_total_mass",
+                     &rcs::hw::FrankaConfig::gravity_compensation_total_mass)
+      .def_readwrite("gravity_compensation_total_com",
+                     &rcs::hw::FrankaConfig::gravity_compensation_total_com)
       .def_readwrite("world_to_robot", &rcs::hw::FrankaConfig::world_to_robot)
       .def_property(
           "tcp_offset",
