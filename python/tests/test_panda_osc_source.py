@@ -71,3 +71,13 @@ def test_joint_stream_uses_repository_torque_controller() -> None:
     assert "TorqueSafetyGuardFn(feedback_tau_array, torque_limit)" in joint_source
     assert "TorqueSafetyGuardFn(tau_d_rate_limited, torque_limit)" not in joint_source
     assert "-> franka::JointPositions" not in joint_source
+
+
+def test_joint_interpolator_uses_minimum_jerk_time_scaling() -> None:
+    source = (REPO_ROOT / "include" / "rcs" / "LinearPoseTrajInterpolator.h").read_text(
+        encoding="utf-8"
+    )
+    joint_interpolator = source[source.index("class LinearJointPositionTrajInterpolator") :]
+
+    assert "const double smooth_t = t3 * (10. + t * (-15. + 6. * t));" in joint_interpolator
+    assert "last_q_t_ = q_start_ + smooth_t * (q_goal_ - q_start_);" in joint_interpolator

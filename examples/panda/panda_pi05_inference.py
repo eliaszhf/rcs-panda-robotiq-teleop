@@ -15,6 +15,7 @@ import argparse
 import copy
 import json
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -146,8 +147,11 @@ def wait_for_velocity_settle(
     *,
     velocity_tolerance: float = 0.01,
     stable_samples: int = 3,
+    sample_interval_seconds: float = 0.025,
     timeout_seconds: float = 1.0,
 ) -> None:
+    """Require the arm to be stationary before accepting another policy target."""
+
     deadline = time.monotonic() + timeout_seconds
     stable = 0
     while time.monotonic() < deadline:
@@ -158,7 +162,7 @@ def wait_for_velocity_settle(
                 return
         else:
             stable = 0
-        time.sleep(0.05)
+        time.sleep(sample_interval_seconds)
     raise RuntimeError("Robot did not settle after the policy command")
 
 
@@ -283,6 +287,16 @@ def validate_action_chunk(response: dict[str, Any]) -> np.ndarray:
     if not np.all(np.isfinite(actions)):
         raise ValueError("Policy actions contain NaN or infinity")
     return actions
+
+
+def infer_action_chunk(
+    client: Any, policy_observation: dict[str, Any]
+) -> tuple[np.ndarray, float]:
+    """Request one action chunk and report server round-trip latency."""
+
+    started = time.monotonic()
+    actions = validate_action_chunk(client.infer(policy_observation))
+    return actions, time.monotonic() - started
 
 
 def bounded_joint_target(
@@ -662,8 +676,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--actions-per-query",
         type=int,
-        default=5,
+        default=10,
         help="Consume this many consecutive actions from each 20-step policy chunk.",
+    )
+    parser.add_argument(
+        "--prefetch-lead-actions",
+        type=int,
+        default=2,
+        help="Start the next policy request this many actions before the current block ends.",
+    )
+    parser.add_argument(
+        "--audit-every",
+        type=int,
+        default=10,
+        help="Print the detailed motion audit every N steps; safety checks still run every step.",
     )
     parser.add_argument("--max-joint-step-deg", type=float, default=0.5)
     parser.add_argument("--max-tcp-step-mm", type=float, default=5.0)
@@ -687,6 +713,10 @@ def main() -> None:
         raise SystemExit("--skip-hold-check and --hold-check-only are incompatible")
     if not (1 <= args.actions_per_query <= EXPECTED_ACTION_HORIZON):
         raise SystemExit(f"--actions-per-query must be between 1 and {EXPECTED_ACTION_HORIZON}")
+    if not (1 <= args.prefetch_lead_actions < args.actions_per_query):
+        raise SystemExit("require 1 <= --prefetch-lead-actions < --actions-per-query")
+    if args.audit_every < 1:
+        raise SystemExit("--audit-every must be positive")
     if args.max_steps < 0:
         raise SystemExit("--max-steps must be non-negative (0 means unlimited)")
     if not (0.0 < args.max_joint_step_deg <= 20.0):
@@ -829,12 +859,10 @@ def main() -> None:
                     return
 
         client.reset()
-        started = time.monotonic()
-        response = client.infer(
-            build_policy_observation(observation, args.instruction, args.camera_name)
+        actions, latency = infer_action_chunk(
+            client,
+            build_policy_observation(observation, args.instruction, args.camera_name),
         )
-        actions = validate_action_chunk(response)
-        latency = time.monotonic() - started
         current = np.asarray(observation["right"]["joints"], dtype=float)
         max_first_delta = float(np.max(np.abs(actions[0, :7] - current)))
         print(
@@ -890,158 +918,194 @@ def main() -> None:
         if input(f"Type '{run_confirmation}' to execute bounded policy actions: ").strip() != run_confirmation:
             raise SystemExit("Cancelled before policy execution.")
 
+        # The audit chunk may be stale if the operator took time to confirm.
+        # Refresh once before motion; subsequent requests are prefetched while
+        # the current action block is executing.
+        observation = refresh_hardware_observation(
+            observation, robot, camera_set, args.camera_name
+        )
+        actions, latency = infer_action_chunk(
+            client,
+            build_policy_observation(observation, args.instruction, args.camera_name),
+        )
+        print(f"POLICY START: latency={latency:.3f}s")
+
         period = 1.0 / float(config["frequency"])
         max_step = np.deg2rad(args.max_joint_step_deg)
         low_control_ticks = 0
         completed_steps = 0
         last_command_time: float | None = None
-        with raw_terminal():
-            unlimited_steps = args.max_steps == 0
-            while unlimited_steps or completed_steps < args.max_steps:
-                if "\x1b" in read_pending_keys(0, 0.0):
-                    print("ESC received; stopping policy execution.")
-                    break
-                if last_command_time is not None:
-                    remaining = period - (time.monotonic() - last_command_time)
-                    if remaining > 0:
-                        time.sleep(remaining)
-                observation = refresh_hardware_observation(
-                    observation, robot, camera_set, args.camera_name
-                )
-                response = client.infer(
-                    build_policy_observation(observation, args.instruction, args.camera_name)
-                )
-                actions = validate_action_chunk(response)
-                for action_index, policy_action in enumerate(actions[: args.actions_per_query]):
-                    if action_index > 0 and last_command_time is not None:
+        next_actions: Future[tuple[np.ndarray, float]] | None = None
+        stop_requested = False
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="pi05-prefetch") as executor:
+            with raw_terminal():
+                unlimited_steps = args.max_steps == 0
+                while unlimited_steps or completed_steps < args.max_steps:
+                    if "\x1b" in read_pending_keys(0, 0.0):
+                        print("ESC received; stopping policy execution.")
+                        break
+                    next_actions = None
+                    for action_index, policy_action in enumerate(
+                        actions[: args.actions_per_query]
+                    ):
+                        if "\x1b" in read_pending_keys(0, 0.0):
+                            print("ESC received; stopping policy execution.")
+                            stop_requested = True
+                            break
+                        current = np.asarray(observation["right"]["joints"], dtype=float)
+                        start_tcp = np.asarray(
+                            observation["right"]["tquat"], dtype=float
+                        ).copy()
+                        raw_joint_delta = policy_action[:7] - current
+                        target = bounded_joint_target(
+                            current,
+                            policy_action[:7],
+                            joint_limits,
+                            joint_margin,
+                            max_step,
+                        )
+                        (
+                            target,
+                            target_tcp,
+                            cartesian_scale,
+                            step_translation,
+                            step_rotation,
+                        ) = bound_joint_target_to_tcp_step(
+                            current,
+                            target,
+                            start_tcp,
+                            kinematics,
+                            robot.get_config().tcp_offset,
+                            args.max_tcp_step_mm / 1000.0,
+                            args.max_tcp_rotation_deg,
+                        )
+                        if not target_tcp_is_safe(target_tcp, config):
+                            raise RuntimeError(
+                                "Policy target would move the tool envelope outside workspace"
+                            )
+                        raw_gripper = float(policy_action[7])
+                        binary_gripper = model_gripper_to_binary(raw_gripper)
+                        observation, _, terminated, truncated, info = env.step(
+                            {
+                                "right": {
+                                    "joints": target,
+                                    "gripper": [binary_gripper],
+                                }
+                            }
+                        )
+                        last_command_time = time.monotonic()
+                        # Let the minimum-jerk interpolation window elapse, then require
+                        # the arm to stop fully before accepting another action.
                         remaining = period - (time.monotonic() - last_command_time)
                         if remaining > 0:
                             time.sleep(remaining)
+                        wait_for_velocity_settle(
+                            robot,
+                            velocity_tolerance=0.01,
+                            stable_samples=3,
+                            timeout_seconds=max(1.0, 5.0 * period),
+                        )
                         observation = refresh_hardware_observation(
                             observation, robot, camera_set, args.camera_name
                         )
-                    current = np.asarray(observation["right"]["joints"], dtype=float)
-                    start_tcp = np.asarray(
-                        observation["right"]["tquat"], dtype=float
-                    ).copy()
-                    raw_joint_delta = policy_action[:7] - current
-                    target = bounded_joint_target(
-                        current,
-                        policy_action[:7],
-                        joint_limits,
-                        joint_margin,
-                        max_step,
-                    )
-                    (
-                        target,
-                        target_tcp,
-                        cartesian_scale,
-                        step_translation,
-                        step_rotation,
-                    ) = bound_joint_target_to_tcp_step(
-                        current,
-                        target,
-                        start_tcp,
-                        kinematics,
-                        robot.get_config().tcp_offset,
-                        args.max_tcp_step_mm / 1000.0,
-                        args.max_tcp_rotation_deg,
-                    )
-                    if not target_tcp_is_safe(target_tcp, config):
-                        raise RuntimeError("Policy target would move the tool envelope outside workspace")
-                    raw_gripper = float(policy_action[7])
-                    binary_gripper = model_gripper_to_binary(raw_gripper)
-                    observation, _, terminated, truncated, info = env.step(
-                        {
-                            "right": {
-                                "joints": target,
-                                "gripper": [binary_gripper],
-                            }
-                        }
-                    )
-                    last_command_time = time.monotonic()
-                    # The upstream joint controller is asynchronous. Let its interpolation
-                    # window elapse, then require the arm to settle before
-                    # auditing or closing a one-step run.
-                    time.sleep(period)
-                    wait_for_velocity_settle(
-                        robot,
-                        velocity_tolerance=0.01,
-                        stable_samples=3,
-                        timeout_seconds=max(1.0, 5.0 * period),
-                    )
-                    observation = refresh_hardware_observation(
-                        observation, robot, camera_set, args.camera_name
-                    )
-                    measured_joints = np.asarray(
-                        observation["right"]["joints"], dtype=float
-                    )
-                    measured_tcp = np.asarray(
-                        observation["right"]["tquat"], dtype=float
-                    )
-                    print(
-                        "COMMAND TRACE: "
-                        f"start_joints_deg={np.rad2deg(current)}, "
-                        f"target_joints_deg={np.rad2deg(target)}, "
-                        "action_reference=absolute-joint-target, "
-                        f"measured_joints_deg={np.rad2deg(measured_joints)}, "
-                        f"start_xyz={start_tcp[:3]}, measured_xyz={measured_tcp[:3]}"
-                    )
-                    achieved_joint_max = float(
-                        np.max(np.abs(measured_joints - current))
-                    )
-                    achieved_translation, achieved_rotation = validate_cartesian_outcome(
-                        start_tcp,
-                        measured_tcp,
-                        max_achieved_translation_meters=args.max_tcp_step_mm / 1000.0,
-                        max_achieved_rotation_degrees=args.max_tcp_rotation_deg,
-                    )
-                    collisions = collision_report(observation)
-                    if collisions:
-                        raise RuntimeError(f"SAFETY STOP: collision signal asserted: {collisions}")
-                    violations = joint_margin_violations(
-                        observation["right"]["joints"], joint_limits, joint_margin
-                    )
-                    if violations:
-                        raise RuntimeError("SAFETY STOP: " + "; ".join(violations))
-                    if not tool_within_workspace(
-                        np.asarray(observation["right"]["tquat"], dtype=float),
-                        np.asarray(config["tool_box_min"], dtype=float),
-                        np.asarray(config["tool_box_max"], dtype=float),
-                        np.asarray(config["workspace_min"], dtype=float),
-                        np.asarray(config["workspace_max"], dtype=float),
-                    ):
-                        raise RuntimeError(
-                            "SAFETY STOP: measured tool envelope left the workspace"
+                        measured_joints = np.asarray(
+                            observation["right"]["joints"], dtype=float
                         )
-                    success_rate = control_command_success_rate(observation)
-                    if success_rate is not None and success_rate < MIN_CONTROL_COMMAND_SUCCESS_RATE:
-                        low_control_ticks += 1
-                    else:
-                        low_control_ticks = 0
-                    if low_control_ticks >= max(
-                        1, int(float(config["frequency"]) * MAX_LOW_CONTROL_SECONDS)
-                    ):
-                        raise RuntimeError("SAFETY STOP: sustained low libfranka command success rate")
-                    if terminated or truncated:
-                        raise RuntimeError(f"Environment stopped: {info}")
-                    completed_steps += 1
-                    print(
-                        f"STEP AUDIT {completed_steps}: "
-                        f"requested_translation={step_translation * 1000.0:.2f} mm, "
-                        f"requested_rotation={step_rotation:.3f} deg, "
-                        f"cartesian_scale={cartesian_scale:.3f}, "
-                        f"raw_max_joint_delta={np.rad2deg(np.max(np.abs(raw_joint_delta))):.3f} deg, "
-                        f"raw_gripper={raw_gripper:.4f}, commanded_gripper={binary_gripper}, "
-                        f"achieved_joint_max={np.rad2deg(achieved_joint_max):.3f} deg, "
-                        f"achieved_translation={achieved_translation * 1000.0:.2f} mm, "
-                        f"achieved_rotation={achieved_rotation:.3f} deg, "
-                        f"measured_xyz={measured_tcp[:3]}"
-                    )
+                        measured_tcp = np.asarray(
+                            observation["right"]["tquat"], dtype=float
+                        )
+                        achieved_joint_max = float(
+                            np.max(np.abs(measured_joints - current))
+                        )
+                        achieved_translation, achieved_rotation = validate_cartesian_outcome(
+                            start_tcp,
+                            measured_tcp,
+                            max_achieved_translation_meters=args.max_tcp_step_mm / 1000.0,
+                            max_achieved_rotation_degrees=args.max_tcp_rotation_deg,
+                        )
+                        collisions = collision_report(observation)
+                        if collisions:
+                            raise RuntimeError(
+                                f"SAFETY STOP: collision signal asserted: {collisions}"
+                            )
+                        violations = joint_margin_violations(
+                            observation["right"]["joints"], joint_limits, joint_margin
+                        )
+                        if violations:
+                            raise RuntimeError("SAFETY STOP: " + "; ".join(violations))
+                        if not tool_within_workspace(
+                            np.asarray(observation["right"]["tquat"], dtype=float),
+                            np.asarray(config["tool_box_min"], dtype=float),
+                            np.asarray(config["tool_box_max"], dtype=float),
+                            np.asarray(config["workspace_min"], dtype=float),
+                            np.asarray(config["workspace_max"], dtype=float),
+                        ):
+                            raise RuntimeError(
+                                "SAFETY STOP: measured tool envelope left the workspace"
+                            )
+                        success_rate = control_command_success_rate(observation)
+                        if (
+                            success_rate is not None
+                            and success_rate < MIN_CONTROL_COMMAND_SUCCESS_RATE
+                        ):
+                            low_control_ticks += 1
+                        else:
+                            low_control_ticks = 0
+                        if low_control_ticks >= max(
+                            1,
+                            int(float(config["frequency"]) * MAX_LOW_CONTROL_SECONDS),
+                        ):
+                            raise RuntimeError(
+                                "SAFETY STOP: sustained low libfranka command success rate"
+                            )
+                        if terminated or truncated:
+                            raise RuntimeError(f"Environment stopped: {info}")
+                        completed_steps += 1
+                        if completed_steps == 1 or completed_steps % args.audit_every == 0:
+                            print(
+                                f"STEP AUDIT {completed_steps}: "
+                                f"requested_translation={step_translation * 1000.0:.2f} mm, "
+                                f"requested_rotation={step_rotation:.3f} deg, "
+                                f"cartesian_scale={cartesian_scale:.3f}, "
+                                f"raw_max_joint_delta={np.rad2deg(np.max(np.abs(raw_joint_delta))):.3f} deg, "
+                                f"raw_gripper={raw_gripper:.4f}, commanded_gripper={binary_gripper}, "
+                                f"achieved_joint_max={np.rad2deg(achieved_joint_max):.3f} deg, "
+                                f"achieved_translation={achieved_translation * 1000.0:.2f} mm, "
+                                f"achieved_rotation={achieved_rotation:.3f} deg, "
+                                f"measured_xyz={measured_tcp[:3]}"
+                            )
+                        actions_left = args.actions_per_query - action_index - 1
+                        more_steps_needed = (
+                            unlimited_steps or completed_steps < args.max_steps
+                        )
+                        if (
+                            next_actions is None
+                            and more_steps_needed
+                            and actions_left == args.prefetch_lead_actions
+                        ):
+                            policy_observation = build_policy_observation(
+                                observation, args.instruction, args.camera_name
+                            )
+                            next_actions = executor.submit(
+                                infer_action_chunk, client, policy_observation
+                            )
+                        if not unlimited_steps and completed_steps >= args.max_steps:
+                            break
+                    if stop_requested:
+                        break
+                    step_limit = "unlimited" if unlimited_steps else str(args.max_steps)
+                    print(f"executed {completed_steps}/{step_limit} policy steps")
                     if not unlimited_steps and completed_steps >= args.max_steps:
                         break
-                step_limit = "unlimited" if unlimited_steps else str(args.max_steps)
-                print(f"executed {completed_steps}/{step_limit} policy steps")
+                    if next_actions is None:
+                        policy_observation = build_policy_observation(
+                            observation, args.instruction, args.camera_name
+                        )
+                        next_actions = executor.submit(
+                            infer_action_chunk, client, policy_observation
+                        )
+                    actions, latency = next_actions.result()
+                    print(f"POLICY PREFETCH: latency={latency:.3f}s")
     finally:
         if env is not None:
             env.close()

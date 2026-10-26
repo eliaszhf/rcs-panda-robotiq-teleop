@@ -7,6 +7,94 @@ Panda 示例和硬件准备说明见 [`examples/panda/README.md`](examples/panda
 π0.5 转换、训练和服务流程见
 [`deployment/pi05_server/README.md`](deployment/pi05_server/README.md)。
 
+### π0.5 真机推理：三个终端完整启动命令
+
+运行前清空机械臂、夹爪、桌面物体和托盘周围的运动空间，并安排操作员全程守住急停。
+下面三个终端必须同时保持打开。
+
+终端 1 在连接 `robomme-new` 的远程 VS Code 中启动 π0.5 服务：
+
+```bash
+cd /home/zhanghf/robomme/teleop_pi05_pipeline
+bin/04_serve_pi05.sh
+```
+
+等待远端显示 `server listening on 127.0.0.1:8000` 后，再继续。ROCm/TPU 后端不可用的
+提示不影响 NVIDIA GPU 推理，只要最终服务成功监听即可。
+
+终端 2 在机器人电脑本地建立 SSH 隧道：
+
+```bash
+ssh -N \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -L 8000:127.0.0.1:8000 \
+  robomme-new
+```
+
+命令正常运行时不会输出内容，也不会返回 shell 提示符；这表示隧道正在保持连接。
+
+终端 3 在机器人电脑本地启动 2000 步受保护推理：
+
+```bash
+cd /home/haifeng/robomme/robot-control-stack
+source /home/haifeng/miniforge3/etc/profile.d/conda.sh
+conda activate rcs
+
+# 每次重启后、首次真机运行前执行一次（需要 sudo 密码）
+sudo examples/panda/panda_realtime_tune.sh 192.168.178.12
+
+python -u examples/panda/panda_pi05_inference.py \
+  --config examples/panda/panda_hardware_session.lab.json \
+  --instruction "pick up the fruit and place it in the tray" \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --execute \
+  --max-steps 2000 \
+  --actions-per-query 10 \
+  --prefetch-lead-actions 2 \
+  --audit-every 10 \
+  --max-joint-step-deg 0.5 \
+  --max-tcp-step-mm 5.0 \
+  --max-tcp-rotation-deg 1.0 \
+  --confirm "EXECUTE-PI05-PANDA 192.168.178.12"
+```
+
+按程序提示依次输入：
+
+```text
+START 192.168.178.12
+MOVE-HOME 192.168.178.12
+JOINT-HOLD 192.168.178.12
+RUN-PI05 192.168.178.12
+```
+
+`JOINT-HOLD` 必须通过后才能执行策略。当前推理程序把模型输出解释为 7 个绝对关节角加
+1 个夹爪值；每次使用 20 步预测中的前 10 步，并在动作块结束前后台预取下一块。每个 action
+使用 minimum-jerk 关节插值并等待机械臂完全停稳；每一步仍执行关节边界、碰撞、工作空间、
+TCP 平移不超过 5 mm 和旋转不超过 1° 的检查。任务完成后按 `ESC` 提前结束，不必等待满
+2000 步。
+
+### 本实验室分支相对原始上游版本的主要改动
+
+原始上游 RCS 提供通用的无 ROS 仿真和真机控制框架；本分支在其基础上增加了面向本实验室
+Panda、Robotiq 2F-85、RealSense 和远程 π0.5 的完整工作流，主要包括：
+
+- Panda + Robotiq 真机键盘遥操、固定 Home、设备检查、工作空间检查、数据记录、离线校验和
+  受保护回放，并支持通信异常后的人工确认恢复。
+- 面向 1 kHz libfranka 控制的非阻塞实时回调、周期诊断、CPU governor/网卡 GRO/IRQ 调优，
+  以及碰撞、关节余量、工具包围盒和命令成功率保护。
+- 针对 Robotiq 负载的关节阻抗、软件重力补偿和 minimum-jerk 关节插值，使直接关节控制在
+  真机上能够稳定保持、平滑到位。
+- 从采集数据转换、归一化统计、π0.5 LoRA 训练、远程服务到 WebSocket/SSH 隧道真机推理的
+  端到端脚本；推理端支持绝对关节 action、动作块预取、夹爪符号转换和逐步安全限幅。
+- RealSense 与 Robotiq 的稳定性修复、RGB-only 轻量采集、工作区外数据目录、VS Code 文件
+  监听优化，以及覆盖上述硬件流程和安全逻辑的自动化测试。
+
+这些扩展主要服务于本实验室的具体硬件、网络地址和训练管线；仓库后半部分保留了上游 RCS
+的通用说明和 API 示例。
+
 每次采集新 episode 时，只需先把 `TASK_INSTRUCTION` 改成本次的真实任务描述，再复制运行整段命令：
 
 ```bash

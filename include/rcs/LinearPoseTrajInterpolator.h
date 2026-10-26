@@ -176,7 +176,14 @@ class LinearJointPositionTrajInterpolator {
     if (last_time_ + dt_ <= time_sec) {
       double t =
           std::min(std::max((time_sec - start_time_) / max_time_, 0.), 1.);
-      last_q_t_ = q_start_ + t * (q_goal_ - q_start_);
+      // Quintic minimum-jerk time scaling. Unlike linear interpolation, this
+      // reaches every action boundary with zero velocity and acceleration, so
+      // stop-and-settle execution does not repeatedly excite the impedance
+      // controller.
+      const double t2 = t * t;
+      const double t3 = t2 * t;
+      const double smooth_t = t3 * (10. + t * (-15. + 6. * t));
+      last_q_t_ = q_start_ + smooth_t * (q_goal_ - q_start_);
       last_time_ = time_sec;
     }
     q_t = last_q_t_;

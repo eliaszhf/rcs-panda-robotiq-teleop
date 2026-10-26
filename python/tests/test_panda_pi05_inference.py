@@ -264,16 +264,42 @@ def test_hold_check_only_returns_after_the_physical_check():
     )
 
 
-def test_policy_step_waits_for_hardware_before_outcome_audit():
+def test_policy_step_waits_for_full_settle_before_outcome_audit():
     source = (EXAMPLE_DIR / "panda_pi05_inference.py").read_text(encoding="utf-8")
     step_block = source[source.index("observation, _, terminated") : source.index("collisions =")]
 
+    assert step_block.index("time.sleep(remaining)") < step_block.index(
+        "wait_for_velocity_settle("
+    )
     assert step_block.index("wait_for_velocity_settle(") < step_block.index(
-        "validate_cartesian_outcome("
+        "refresh_hardware_observation("
     )
     assert step_block.index("refresh_hardware_observation(") < step_block.index(
         "validate_cartesian_outcome("
     )
+
+
+def test_velocity_settle_keeps_strict_threshold_with_faster_polling():
+    source = (EXAMPLE_DIR / "panda_pi05_inference.py").read_text(encoding="utf-8")
+    settle = source[
+        source.index("def wait_for_velocity_settle(") : source.index(
+            "def run_configured_origin_hold_check("
+        )
+    ]
+
+    assert "velocity_tolerance: float = 0.01" in settle
+    assert "stable_samples: int = 3" in settle
+    assert "sample_interval_seconds: float = 0.025" in settle
+    assert "time.sleep(sample_interval_seconds)" in settle
+
+
+def test_policy_loop_prefetches_chunks_without_sync_inference():
+    source = (EXAMPLE_DIR / "panda_pi05_inference.py").read_text(encoding="utf-8")
+    loop = source[source.index("with ThreadPoolExecutor") : source.index("finally:")]
+
+    assert "executor.submit(" in loop
+    assert "next_actions.result()" in loop
+    assert "client.infer(" not in loop
 
 
 def test_hardware_policy_uses_absolute_joint_control_for_joint_checkpoint():
